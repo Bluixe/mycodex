@@ -7,10 +7,17 @@ name = "mycodex"
 version = "0.1.0"
 description = "Local Codex project and session manager"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+]
 
 [project.scripts]
 mycodex = "mycodex.cli:main"
 
 [tool.setuptools]
 packages = ["mycodex"]
+
+[tool.setuptools.package-data]
+mycodex = ["templates/*.html", "static/*.css", "static/*.js"]

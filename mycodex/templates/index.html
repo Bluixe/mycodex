@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>Projects</h1>
+    <p>{{ snapshot.project_count }} connected project(s). Daemon: {{ snapshot.daemon.label }}</p>
+  </div>
+  <div class="timestamp">Updated {{ snapshot.generated_at_text }}</div>
+</section>
+
+{% if snapshot.projects %}
+<section class="project-grid">
+  {% for card in snapshot.projects %}
+  <article class="project-card">
+    <div class="card-top">
+      <div>
+        <h2><a href="/projects/{{ card.project.name }}">{{ card.project.name }}</a></h2>
+        <p class="path">{{ card.project.path }}</p>
+      </div>
+      <span class="badge {{ card.health.severity }}">{{ card.health.label }}</span>
+    </div>
+
+    <dl class="metrics">
+      <div><dt>Sessions</dt><dd>{{ card.session_count }}</dd></div>
+      <div><dt>Open todos</dt><dd>{{ card.open_todo_count }}</dd></div>
+      <div><dt>Daily</dt><dd>{{ card.daily_summary.time if card.daily_summary.enabled else "off" }}</dd></div>
+    </dl>
+
+    <div class="facts">
+      {% if card.git.state == "git" %}
+      <div>Git: <code>{{ card.git.branch }}</code> <code>{{ card.git.sha }}</code> dirty={{ card.git.dirty_count }}</div>
+      {% else %}
+      <div>Git: {{ card.git.summary }}</div>
+      {% endif %}
+      {% if card.latest_run %}
+      <div>Latest run: <a href="/runs/{{ card.latest_run.id }}">#{{ card.latest_run.id }}</a> {{ card.latest_run.kind }} {{ card.latest_run.status }}</div>
+      {% else %}
+      <div>Latest run: none</div>
+      {% endif %}
+      {% if card.latest_session %}
+      <div>Latest session: <code>{{ card.latest_session.thread_id }}</code></div>
+      {% else %}
+      <div>Latest session: none</div>
+      {% endif %}
+    </div>
+
+    <div class="actions">
+      <form method="post" action="/projects/{{ card.project.name }}/sync">
+        <button type="submit">Sync</button>
+      </form>
+      <a class="button secondary" href="/projects/{{ card.project.name }}">Open</a>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% else %}
+<section class="empty">
+  <h2>No projects</h2>
+  <p>Add one with <code>mycodex projects connect NAME PATH</code>.</p>
+</section>
+{% endif %}
+{% endblock %}

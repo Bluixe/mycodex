@@ -5,7 +5,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 
 DEFAULT_DB_PATH = Path(os.environ.get("MYCODEX_DB", "data/my_codex.sqlite"))
@@ -24,9 +24,11 @@ class Store:
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.path = resolve_db_path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self.init_schema()
 
     def close(self) -> None:
@@ -97,6 +99,23 @@ class Store:
 
             CREATE INDEX IF NOT EXISTS idx_runs_project_started
                 ON runs(project_id, started_at DESC);
+
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2,
+                source_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+                due_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_todos_project_status
+                ON todos(project_id, status, priority, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,6 +359,158 @@ class Store:
             )
         )
 
+    def get_run(self, run_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT runs.*, projects.name AS project_name, projects.path AS project_path
+            FROM runs
+            JOIN projects ON projects.id = runs.project_id
+            WHERE runs.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+    def add_todo(
+        self,
+        project_id: int,
+        *,
+        title: str,
+        body: str = "",
+        priority: int = 2,
+        status: str = "open",
+        source_run_id: int | None = None,
+        due_at: int | None = None,
+    ) -> int:
+        title = title.strip()
+        if not title:
+            raise ValueError("todo title is required")
+        status = _validate_todo_status(status)
+        priority = _validate_priority(priority)
+        ts = now_ts()
+        cur = self.conn.execute(
+            """
+            INSERT INTO todos (
+                project_id, title, body, status, priority, source_run_id,
+                due_at, created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                title,
+                body.strip(),
+                status,
+                priority,
+                source_run_id,
+                due_at,
+                ts,
+                ts,
+                ts if status == "done" else None,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_todo(self, todo_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT todos.*, projects.name AS project_name
+            FROM todos
+            JOIN projects ON projects.id = todos.project_id
+            WHERE todos.id = ?
+            """,
+            (todo_id,),
+        ).fetchone()
+
+    def list_todos(
+        self,
+        project_id: int,
+        *,
+        statuses: Sequence[str] | None = None,
+        include_archived: bool = False,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if statuses:
+            for status in statuses:
+                _validate_todo_status(status)
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        elif not include_archived:
+            clauses.append("status != 'archived'")
+        sql = f"""
+            SELECT *
+            FROM todos
+            WHERE {" AND ".join(clauses)}
+            ORDER BY
+                CASE status
+                    WHEN 'doing' THEN 0
+                    WHEN 'blocked' THEN 1
+                    WHEN 'open' THEN 2
+                    WHEN 'done' THEN 3
+                    ELSE 4
+                END,
+                priority ASC,
+                updated_at DESC,
+                id DESC
+        """
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return list(self.conn.execute(sql, params))
+
+    def update_todo_status(self, todo_id: int, status: str) -> None:
+        status = _validate_todo_status(status)
+        completed_at = now_ts() if status == "done" else None
+        self.conn.execute(
+            """
+            UPDATE todos
+            SET status = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, completed_at, now_ts(), todo_id),
+        )
+        self.conn.commit()
+
+    def update_todo(
+        self,
+        todo_id: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        priority: int | None = None,
+        due_at: int | None = None,
+    ) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        if title is not None:
+            title = title.strip()
+            if not title:
+                raise ValueError("todo title is required")
+            fields.append("title = ?")
+            params.append(title)
+        if body is not None:
+            fields.append("body = ?")
+            params.append(body.strip())
+        if priority is not None:
+            fields.append("priority = ?")
+            params.append(_validate_priority(priority))
+        if due_at is not None:
+            fields.append("due_at = ?")
+            params.append(due_at)
+        if not fields:
+            return
+        fields.append("updated_at = ?")
+        params.append(now_ts())
+        params.append(todo_id)
+        self.conn.execute(
+            f"UPDATE todos SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+
     def add_rule(
         self,
         project_id: int,
@@ -432,3 +603,18 @@ class Store:
             (project_id, kind, since_ts, *statuses),
         ).fetchone()
         return row is not None
+
+
+TODO_STATUSES = {"open", "doing", "blocked", "done", "archived"}
+
+
+def _validate_todo_status(status: str) -> str:
+    if status not in TODO_STATUSES:
+        raise ValueError(f"invalid todo status {status!r}; choose one of {sorted(TODO_STATUSES)}")
+    return status
+
+
+def _validate_priority(priority: int) -> int:
+    if priority not in {1, 2, 3}:
+        raise ValueError("todo priority must be 1, 2, or 3")
+    return priority

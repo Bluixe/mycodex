@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }} - mycodex</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    <script defer src="{{ url_for('static', path='app.js') }}"></script>
+  </head>
+  <body data-refresh-interval="{{ refresh_interval_ms|default(0) }}">
+    <header class="topbar">
+      <a class="brand" href="/">mycodex</a>
+      <div class="meta">
+        <span>{{ db_path }}</span>
+      </div>
+    </header>
+    <main class="page">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

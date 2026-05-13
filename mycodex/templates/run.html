@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <div class="crumb"><a href="/">Projects</a> / <a href="/projects/{{ run.project_name }}">{{ run.project_name }}</a></div>
+    <h1>Run #{{ run.id }}</h1>
+    <p>{{ run.kind }} · {{ run.status }}</p>
+  </div>
+  <span class="badge {{ 'danger' if run.status == 'failed' else 'info' if run.status == 'running' else 'ok' }}">{{ run.status }}</span>
+</section>
+
+<section class="panel">
+  <dl class="run-meta">
+    <div><dt>Project</dt><dd>{{ run.project_name }}</dd></div>
+    <div><dt>Thread</dt><dd><code>{{ run.thread_id or "-" }}</code></dd></div>
+    <div><dt>Started</dt><dd>{{ run.started_at|ts }}</dd></div>
+    <div><dt>Completed</dt><dd>{{ run.completed_at|ts }}</dd></div>
+  </dl>
+</section>
+
+<section class="panel">
+  <h2>Prompt</h2>
+  <pre class="output">{{ run.prompt }}</pre>
+</section>
+
+{% if run.error %}
+<section class="panel">
+  <h2>Error</h2>
+  <pre class="output error">{{ run.error }}</pre>
+</section>
+{% endif %}
+
+{% if run.output_text %}
+<section class="panel">
+  <h2>Output</h2>
+  <pre class="output">{{ run.output_text }}</pre>
+</section>
+{% endif %}
+{% endblock %}

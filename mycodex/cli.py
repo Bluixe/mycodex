@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--timeout", type=int, default=1800)
     daemon.set_defaults(handler=cmd_daemon)
 
+    web = sub.add_parser("web", help="Run the local web dashboard")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--reload", action="store_true")
+    web.set_defaults(handler=cmd_web)
+
     rules = sub.add_parser("rules", help="Manage local scheduled rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)
     r_list = rules_sub.add_parser("list", help="List rules")
@@ -347,6 +353,17 @@ def cmd_daily_summary(store: Store, args) -> None:
 def cmd_daemon(store: Store, args) -> None:
     print(f"mycodex daemon started; db={store.path}; interval={args.interval}s")
     run_daemon(store, interval_seconds=args.interval, once=args.once, timeout=args.timeout)
+
+
+def cmd_web(store: Store, args) -> None:
+    try:
+        from .web import run_web
+    except ImportError as exc:
+        raise RuntimeError(
+            "web dashboard dependencies are missing; install with `pip install -e .`"
+        ) from exc
+    print(f"mycodex web dashboard: http://{args.host}:{args.port}")
+    run_web(db_path=store.path, host=args.host, port=args.port, reload=args.reload)
 
 
 def cmd_rules_list(store: Store, args) -> None:

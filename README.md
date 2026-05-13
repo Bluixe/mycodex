@@ -88,6 +88,14 @@ For a single scheduler pass, useful from launchd/cron:
 mycodex daemon --once
 ```
 
+Run the local web dashboard:
+
+```bash
+mycodex web --host 127.0.0.1 --port 8765
+```
+
+The dashboard shows connected projects, git/session/run/rule status, project todos, and quick actions for syncing sessions, sending prompts, and running daily summaries. It only listens on localhost by default.
+
 ## Safety Model
 
 Projects default to:
@@ -127,6 +135,14 @@ Inspect rules and run history:
 ```bash
 mycodex rules list
 mycodex runs list --project my-codex
+```
+
+## Todos
+
+The web dashboard stores lightweight per-project todos in the same SQLite database. Todo states are:
+
+```text
+open, doing, blocked, done, archived
 ```
 
 ## Data

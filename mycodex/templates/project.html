@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% set project = snapshot.project %}
+<section class="page-head">
+  <div>
+    <div class="crumb"><a href="/">Projects</a> / {{ project.name }}</div>
+    <h1>{{ project.name }}</h1>
+    <p>{{ project.path }}</p>
+  </div>
+  <span class="badge {{ snapshot.health.severity }}">{{ snapshot.health.label }}</span>
+</section>
+
+<section class="layout">
+  <div class="main-column">
+    <section class="panel">
+      <h2>Status</h2>
+      <div class="status-grid">
+        <div>
+          <span class="label">Git</span>
+          {% if snapshot.git.state == "git" %}
+          <strong>{{ snapshot.git.branch }} {{ snapshot.git.sha }}</strong>
+          <span>dirty={{ snapshot.git.dirty_count }}</span>
+          {% else %}
+          <strong>{{ snapshot.git.summary }}</strong>
+          {% endif %}
+        </div>
+        <div>
+          <span class="label">Sessions</span>
+          <strong>{{ snapshot.session_count }}</strong>
+        </div>
+        <div>
+          <span class="label">Daily summary</span>
+          <strong>{{ snapshot.daily_summary.time if snapshot.daily_summary.enabled else "off" }}</strong>
+          <span>{{ snapshot.daily_summary.next_due_text }}</span>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <strong>{{ project.sandbox }}</strong>
+          <span>{{ project.approval_policy }}</span>
+        </div>
+      </div>
+      <ul class="reason-list">
+        {% for reason in snapshot.health.reasons %}
+        <li>{{ reason }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="panel" id="todos">
+      <div class="section-head">
+        <h2>Todos</h2>
+        <span>{{ snapshot.open_todo_count }} open</span>
+      </div>
+      <form class="todo-form" method="post" action="/projects/{{ project.name }}/todos">
+        <input name="title" placeholder="Next task" required>
+        <select name="priority">
+          <option value="1">High</option>
+          <option value="2" selected>Normal</option>
+          <option value="3">Low</option>
+        </select>
+        <textarea name="body" placeholder="Optional detail"></textarea>
+        <button type="submit">Add</button>
+      </form>
+
+      {% if snapshot.todos %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Task</th><th>Priority</th><th>Status</th><th>Updated</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for todo in snapshot.todos %}
+            <tr class="{{ 'muted-row' if todo.status in ['done', 'archived'] else '' }}">
+              <td>
+                <strong>{{ todo.title }}</strong>
+                {% if todo.body %}<p>{{ todo.body }}</p>{% endif %}
+              </td>
+              <td>{{ todo.priority|priority }}</td>
+              <td><span class="pill">{{ todo.status }}</span></td>
+              <td>{{ todo.updated_at|ts }}</td>
+              <td>
+                <form method="post" action="/todos/{{ todo.id }}/status" class="inline-form">
+                  <select name="status">
+                    {% for status in ["open", "doing", "blocked", "done", "archived"] %}
+                    <option value="{{ status }}" {{ "selected" if status == todo.status else "" }}>{{ status }}</option>
+                    {% endfor %}
+                  </select>
+                  <button type="submit">Set</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No todos yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Runs</h2>
+      </div>
+      {% if snapshot.runs %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Kind</th><th>Status</th><th>Started</th><th>Thread</th></tr>
+          </thead>
+          <tbody>
+            {% for run in snapshot.runs %}
+            <tr>
+              <td><a href="/runs/{{ run.id }}">#{{ run.id }}</a></td>
+              <td>{{ run.kind }}</td>
+              <td><span class="pill">{{ run.status }}</span></td>
+              <td>{{ run.started_at|ts }}</td>
+              <td><code>{{ run.thread_id or "-" }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No runs recorded.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Sessions</h2>
+      {% if snapshot.sessions %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Thread</th><th>Status</th><th>Updated</th><th>Preview</th></tr>
+          </thead>
+          <tbody>
+            {% for session in snapshot.sessions %}
+            <tr>
+              <td><code>{{ session.thread_id }}</code></td>
+              <td>{{ session.status_type }}</td>
+              <td>{{ session.updated_at|ts }}</td>
+              <td>{{ session.name or session.preview }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No sessions stored. Sync this project first.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <aside class="side-column">
+    <section class="panel">
+      <h2>Actions</h2>
+      <div class="stack">
+        <form method="post" action="/projects/{{ project.name }}/sync">
+          <button type="submit">Sync sessions</button>
+        </form>
+        <form method="post" action="/projects/{{ project.name }}/daily-summary">
+          <button type="submit">Daily summary</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Send Prompt</h2>
+      <form method="post" action="/projects/{{ project.name }}/send" class="send-form">
+        <textarea name="prompt" placeholder="Ask this project's default Codex session..." required></textarea>
+        <label class="check"><input type="checkbox" name="new_thread"> New thread</label>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Rules</h2>
+      {% if snapshot.rules %}
+      <ul class="rule-list">
+        {% for rule in snapshot.rules %}
+        <li>
+          <strong>{{ rule.name }}</strong>
+          <span>{{ rule.kind }} · {{ rule|schedule }} · {{ "on" if rule.enabled else "off" }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">No rules.</p>
+      {% endif %}
+    </section>
+  </aside>
+</section>
+{% endblock %}

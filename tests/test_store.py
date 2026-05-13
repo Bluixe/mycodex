@@ -6,6 +6,7 @@ from pathlib import Path
 
 from mycodex.db import Store
 from mycodex.prompts import daily_summary_prompt
+from mycodex.status import project_snapshot, snapshot_to_jsonable
 
 
 class StoreTests(unittest.TestCase):
@@ -50,6 +51,45 @@ class StoreTests(unittest.TestCase):
                 runs = store.list_runs(project["id"])
                 self.assertEqual(runs[0]["status"], "completed")
                 self.assertEqual(runs[0]["output_text"], "done")
+
+    def test_todos_are_recorded_and_updated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                todo_id = store.add_todo(
+                    project["id"],
+                    title="Run smoke test",
+                    body="Use a tiny config.",
+                    priority=1,
+                )
+
+                todos = store.list_todos(project["id"])
+                self.assertEqual(len(todos), 1)
+                self.assertEqual(todos[0]["title"], "Run smoke test")
+                self.assertEqual(todos[0]["status"], "open")
+
+                store.update_todo_status(todo_id, "done")
+                todo = store.get_todo(todo_id)
+                self.assertIsNotNone(todo)
+                self.assertEqual(todo["status"], "done")
+                self.assertIsNotNone(todo["completed_at"])
+
+    def test_project_snapshot_includes_todos_and_failed_run_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                store.add_todo(project["id"], title="Fix failure", status="blocked")
+                run_id = store.add_run(project["id"], kind="manual", prompt="hi")
+                store.finish_run(run_id, status="failed", error="boom")
+
+                snapshot = snapshot_to_jsonable(project_snapshot(store, "demo"))
+                self.assertEqual(snapshot["open_todo_count"], 1)
+                self.assertEqual(snapshot["health"]["severity"], "danger")
+                self.assertEqual(snapshot["latest_run"]["status"], "failed")
 
 
 class PromptTests(unittest.TestCase):
