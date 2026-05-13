@@ -135,6 +135,45 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--reload", action="store_true")
     web.set_defaults(handler=cmd_web)
 
+    telegram = sub.add_parser("telegram", help="Run and manage the Telegram adapter")
+    telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
+
+    tg_run = telegram_sub.add_parser("run", help="Run the Telegram long-polling bot")
+    tg_run.add_argument("--token")
+    tg_run.add_argument("--token-env", default="MYCODEX_TELEGRAM_BOT_TOKEN")
+    tg_run.add_argument("--allow-user", action="append", default=[])
+    tg_run.add_argument("--poll-timeout", type=int, default=30)
+    tg_run.add_argument("--codex-timeout", type=int, default=1800)
+    tg_run.add_argument("--proxy-url")
+    tg_run.set_defaults(handler=cmd_telegram_run)
+
+    tg_allow = telegram_sub.add_parser("allow", help="Allow a Telegram user id")
+    tg_allow.add_argument("user_id")
+    tg_allow.add_argument("--username", default="")
+    tg_allow.set_defaults(handler=cmd_telegram_allow)
+
+    tg_deny = telegram_sub.add_parser("deny", help="Deny a Telegram user id")
+    tg_deny.add_argument("user_id")
+    tg_deny.set_defaults(handler=cmd_telegram_deny)
+
+    tg_users = telegram_sub.add_parser("users", help="List Telegram users")
+    tg_users.set_defaults(handler=cmd_telegram_users)
+
+    tg_bindings = telegram_sub.add_parser("bindings", help="List Telegram bindings")
+    tg_bindings.set_defaults(handler=cmd_telegram_bindings)
+
+    tg_bind = telegram_sub.add_parser("bind", help="Bind a Telegram chat/topic to a project")
+    tg_bind.add_argument("chat_id")
+    tg_bind.add_argument("project")
+    tg_bind.add_argument("--message-thread-id")
+    tg_bind.add_argument("--thread-id")
+    tg_bind.set_defaults(handler=cmd_telegram_bind)
+
+    tg_unbind = telegram_sub.add_parser("unbind", help="Remove a Telegram chat/topic binding")
+    tg_unbind.add_argument("chat_id")
+    tg_unbind.add_argument("--message-thread-id")
+    tg_unbind.set_defaults(handler=cmd_telegram_unbind)
+
     rules = sub.add_parser("rules", help="Manage local scheduled rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)
     r_list = rules_sub.add_parser("list", help="List rules")
@@ -364,6 +403,87 @@ def cmd_web(store: Store, args) -> None:
         ) from exc
     print(f"mycodex web dashboard: http://{args.host}:{args.port}")
     run_web(db_path=store.path, host=args.host, port=args.port, reload=args.reload)
+
+
+def cmd_telegram_run(store: Store, args) -> None:
+    from .telegram import TelegramBot, token_from_env
+
+    for user_id in args.allow_user:
+        store.allow_telegram_user(user_id)
+        print(f"Allowed Telegram user {user_id}.")
+    token = args.token or token_from_env(args.token_env)
+    bot = TelegramBot(
+        db_path=store.path,
+        token=token,
+        poll_timeout=args.poll_timeout,
+        codex_timeout=args.codex_timeout,
+        proxy_url=args.proxy_url,
+    )
+    bot.run()
+
+
+def cmd_telegram_allow(store: Store, args) -> None:
+    store.allow_telegram_user(args.user_id, args.username)
+    print(f"Allowed Telegram user {args.user_id}.")
+
+
+def cmd_telegram_deny(store: Store, args) -> None:
+    store.deny_telegram_user(args.user_id)
+    print(f"Denied Telegram user {args.user_id}.")
+
+
+def cmd_telegram_users(store: Store, _args) -> None:
+    users = store.list_telegram_users()
+    if not users:
+        print("No Telegram users.")
+        return
+    for user in users:
+        state = "allowed" if user["allowed"] else "denied"
+        username = f"@{user['username']}" if user["username"] else "-"
+        print(f"{user['user_id']}\t{state}\t{username}")
+
+
+def cmd_telegram_bindings(store: Store, _args) -> None:
+    bindings = store.list_telegram_bindings()
+    if not bindings:
+        print("No Telegram bindings.")
+        return
+    for binding in bindings:
+        topic = binding["message_thread_id"] or "-"
+        thread = binding["thread_id"] or "-"
+        print(
+            f"chat={binding['chat_id']}\ttopic={topic}\t"
+            f"project={binding['project_name']}\tthread={thread}"
+        )
+
+
+def cmd_telegram_bind(store: Store, args) -> None:
+    project = _require_project(store, args.project)
+    thread_id = args.thread_id or project["default_thread_id"]
+    if thread_id is None:
+        latest = store.latest_session(project["id"])
+        thread_id = latest["thread_id"] if latest else None
+    store.set_telegram_binding(
+        chat_id=args.chat_id,
+        message_thread_id=args.message_thread_id,
+        project_id=project["id"],
+        thread_id=thread_id,
+    )
+    print(
+        f"Bound chat={args.chat_id} topic={args.message_thread_id or '-'} "
+        f"to {project['name']} thread={thread_id or '-'}."
+    )
+
+
+def cmd_telegram_unbind(store: Store, args) -> None:
+    removed = store.remove_telegram_binding(
+        chat_id=args.chat_id,
+        message_thread_id=args.message_thread_id,
+    )
+    if removed:
+        print(f"Removed binding for chat={args.chat_id} topic={args.message_thread_id or '-'}.")
+    else:
+        print("No matching binding.")
 
 
 def cmd_rules_list(store: Store, args) -> None:

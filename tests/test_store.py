@@ -47,7 +47,9 @@ class StoreTests(unittest.TestCase):
                 project_path.mkdir()
                 project = store.add_project("demo", project_path)
                 run_id = store.add_run(project["id"], kind="manual", prompt="hi")
+                self.assertIsNotNone(store.active_run_for_project(project["id"]))
                 store.finish_run(run_id, status="completed", output_text="done")
+                self.assertIsNone(store.active_run_for_project(project["id"]))
                 runs = store.list_runs(project["id"])
                 self.assertEqual(runs[0]["status"], "completed")
                 self.assertEqual(runs[0]["output_text"], "done")
@@ -75,6 +77,33 @@ class StoreTests(unittest.TestCase):
                 self.assertIsNotNone(todo)
                 self.assertEqual(todo["status"], "done")
                 self.assertIsNotNone(todo["completed_at"])
+
+    def test_telegram_users_and_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+
+                self.assertFalse(store.telegram_user_allowed("42"))
+                store.allow_telegram_user("42", "alice")
+                self.assertTrue(store.telegram_user_allowed("42"))
+                self.assertEqual(store.get_telegram_user("42")["username"], "alice")
+
+                store.set_telegram_binding(
+                    chat_id="-100",
+                    message_thread_id="7",
+                    project_id=project["id"],
+                    thread_id="thread-1",
+                )
+                binding = store.get_telegram_binding(chat_id="-100", message_thread_id="7")
+                self.assertIsNotNone(binding)
+                self.assertEqual(binding["project_name"], "demo")
+                self.assertEqual(binding["thread_id"], "thread-1")
+
+                removed = store.remove_telegram_binding(chat_id="-100", message_thread_id="7")
+                self.assertTrue(removed)
+                self.assertIsNone(store.get_telegram_binding(chat_id="-100", message_thread_id="7"))
 
     def test_project_snapshot_includes_todos_and_failed_run_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -131,6 +131,29 @@ class Store:
                 updated_at INTEGER NOT NULL,
                 UNIQUE(project_id, name)
             );
+
+            CREATE TABLE IF NOT EXISTS telegram_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL DEFAULT '',
+                allowed INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS telegram_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                message_thread_id TEXT NOT NULL DEFAULT '',
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                thread_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(chat_id, message_thread_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_telegram_bindings_project
+                ON telegram_bindings(project_id);
             """
         )
         self.conn.commit()
@@ -370,6 +393,43 @@ class Store:
             (run_id,),
         ).fetchone()
 
+    def active_run_for_thread(self, thread_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT runs.*, projects.name AS project_name
+            FROM runs
+            JOIN projects ON projects.id = runs.project_id
+            WHERE runs.thread_id = ? AND runs.status = 'running'
+            ORDER BY runs.started_at DESC
+            LIMIT 1
+            """,
+            (thread_id,),
+        ).fetchone()
+
+    def active_run_for_project(
+        self,
+        project_id: int,
+        *,
+        kind_prefix: str | None = None,
+    ) -> sqlite3.Row | None:
+        params: list[Any] = [project_id]
+        kind_clause = ""
+        if kind_prefix:
+            kind_clause = "AND runs.kind LIKE ?"
+            params.append(f"{kind_prefix}%")
+        return self.conn.execute(
+            f"""
+            SELECT runs.*, projects.name AS project_name
+            FROM runs
+            JOIN projects ON projects.id = runs.project_id
+            WHERE runs.project_id = ? AND runs.status = 'running'
+            {kind_clause}
+            ORDER BY runs.started_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+
     def add_todo(
         self,
         project_id: int,
@@ -604,6 +664,120 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def allow_telegram_user(self, user_id: int | str, username: str = "") -> None:
+        ts = now_ts()
+        self.conn.execute(
+            """
+            INSERT INTO telegram_users (user_id, username, allowed, created_at, updated_at)
+            VALUES (?, ?, 1, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                allowed = 1,
+                updated_at = excluded.updated_at
+            """,
+            (str(user_id), username or "", ts, ts),
+        )
+        self.conn.commit()
+
+    def deny_telegram_user(self, user_id: int | str) -> None:
+        self.conn.execute(
+            "UPDATE telegram_users SET allowed = 0, updated_at = ? WHERE user_id = ?",
+            (now_ts(), str(user_id)),
+        )
+        self.conn.commit()
+
+    def get_telegram_user(self, user_id: int | str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM telegram_users WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+
+    def telegram_user_allowed(self, user_id: int | str) -> bool:
+        user = self.get_telegram_user(user_id)
+        return bool(user and user["allowed"])
+
+    def list_telegram_users(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM telegram_users ORDER BY allowed DESC, user_id"
+            )
+        )
+
+    def set_telegram_binding(
+        self,
+        *,
+        chat_id: int | str,
+        message_thread_id: int | str | None,
+        project_id: int,
+        thread_id: str | None,
+    ) -> None:
+        ts = now_ts()
+        self.conn.execute(
+            """
+            INSERT INTO telegram_bindings (
+                chat_id, message_thread_id, project_id, thread_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, message_thread_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                thread_id = excluded.thread_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(chat_id),
+                _telegram_thread_key(message_thread_id),
+                project_id,
+                thread_id,
+                ts,
+                ts,
+            ),
+        )
+        self.conn.commit()
+
+    def get_telegram_binding(
+        self,
+        *,
+        chat_id: int | str,
+        message_thread_id: int | str | None,
+    ) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT telegram_bindings.*, projects.name AS project_name, projects.path AS project_path
+            FROM telegram_bindings
+            JOIN projects ON projects.id = telegram_bindings.project_id
+            WHERE chat_id = ? AND message_thread_id = ?
+            """,
+            (str(chat_id), _telegram_thread_key(message_thread_id)),
+        ).fetchone()
+
+    def list_telegram_bindings(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT telegram_bindings.*, projects.name AS project_name, projects.path AS project_path
+                FROM telegram_bindings
+                JOIN projects ON projects.id = telegram_bindings.project_id
+                ORDER BY chat_id, message_thread_id
+                """
+            )
+        )
+
+    def remove_telegram_binding(
+        self,
+        *,
+        chat_id: int | str,
+        message_thread_id: int | str | None,
+    ) -> bool:
+        cur = self.conn.execute(
+            """
+            DELETE FROM telegram_bindings
+            WHERE chat_id = ? AND message_thread_id = ?
+            """,
+            (str(chat_id), _telegram_thread_key(message_thread_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
 
 TODO_STATUSES = {"open", "doing", "blocked", "done", "archived"}
 
@@ -618,3 +792,9 @@ def _validate_priority(priority: int) -> int:
     if priority not in {1, 2, 3}:
         raise ValueError("todo priority must be 1, 2, or 3")
     return priority
+
+
+def _telegram_thread_key(message_thread_id: int | str | None) -> str:
+    if message_thread_id is None:
+        return ""
+    return str(message_thread_id)

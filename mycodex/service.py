@@ -57,12 +57,14 @@ def send_prompt(
     *,
     kind: str = "manual",
     new_thread: bool = False,
+    thread_id: str | None = None,
     timeout: int = 1800,
     sync_first: bool = True,
     sandbox: str | None = None,
     approval_policy: str | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    update_default_thread: bool = True,
 ) -> dict[str, Any]:
     project = require_project(store, project_name)
     if sync_first:
@@ -73,32 +75,33 @@ def send_prompt(
             # Sending can still work with a stored thread id even if sync is unavailable.
             pass
 
-    thread_id = None if new_thread else project["default_thread_id"]
-    if thread_id is None and not new_thread:
+    chosen_thread_id = None if new_thread else thread_id or project["default_thread_id"]
+    if chosen_thread_id is None and not new_thread:
         latest = store.latest_session(project["id"])
-        thread_id = latest["thread_id"] if latest else None
+        chosen_thread_id = latest["thread_id"] if latest else None
 
     chosen_sandbox = ensure_valid_sandbox(sandbox or project["sandbox"])
     chosen_approval = ensure_valid_approval_policy(approval_policy or project["approval_policy"])
     chosen_model = model or project["model"]
     chosen_effort = reasoning_effort or project["reasoning_effort"]
 
-    run_id = store.add_run(project["id"], kind=kind, prompt=prompt, thread_id=thread_id)
+    run_id = store.add_run(project["id"], kind=kind, prompt=prompt, thread_id=chosen_thread_id)
     try:
         with CodexAppServerClient() as client:
             thread = client.start_or_resume_thread(
-                thread_id=thread_id,
+                thread_id=chosen_thread_id,
                 cwd=project["path"],
                 sandbox=chosen_sandbox,
                 approval_policy=chosen_approval,
                 model=chosen_model,
                 reasoning_effort=chosen_effort,
             )
-            thread_id = thread["id"]
+            chosen_thread_id = thread["id"]
             store.upsert_session(project["id"], thread)
-            store.update_default_thread(project["id"], thread_id)
+            if update_default_thread:
+                store.update_default_thread(project["id"], chosen_thread_id)
             turn_id, turn = client.start_turn(
-                thread_id=thread_id,
+                thread_id=chosen_thread_id,
                 prompt=prompt,
                 cwd=project["path"],
                 approval_policy=chosen_approval,
@@ -106,7 +109,7 @@ def send_prompt(
                 reasoning_effort=chosen_effort,
             )
             result = client.wait_for_turn(
-                thread_id=thread_id,
+                thread_id=chosen_thread_id,
                 turn_id=turn_id,
                 timeout=timeout,
             )
@@ -117,11 +120,11 @@ def send_prompt(
                 status=status,
                 output_text=result.output_text,
                 raw_json=raw,
-                thread_id=thread_id,
+                thread_id=chosen_thread_id,
             )
             return {
                 "run_id": run_id,
-                "thread_id": thread_id,
+                "thread_id": chosen_thread_id,
                 "turn_id": turn_id,
                 "status": status,
                 "output_text": result.output_text,
@@ -131,7 +134,7 @@ def send_prompt(
             run_id,
             status="failed",
             error=str(exc),
-            thread_id=thread_id,
+            thread_id=chosen_thread_id,
         )
         raise
 

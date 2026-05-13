@@ -96,6 +96,58 @@ mycodex web --host 127.0.0.1 --port 8765
 
 The dashboard shows connected projects, git/session/run/rule status, project todos, and quick actions for syncing sessions, sending prompts, and running daily summaries. It only listens on localhost by default.
 
+Run the Telegram adapter:
+
+```bash
+export MYCODEX_TELEGRAM_BOT_TOKEN="123456:bot-token"
+mycodex telegram allow TELEGRAM_USER_ID
+mycodex telegram run
+```
+
+The Telegram adapter uses long polling and stores only users/bindings in SQLite. The bot token is read from the environment by default and is not stored in the database.
+If Telegram needs your local proxy, run with `--proxy-url http://127.0.0.1:7890` or set standard proxy environment variables before starting the bot.
+
+Bind a Telegram DM, group, or forum topic to a mycodex project and Codex thread:
+
+```text
+/projects
+/bind my-codex
+/bind_thread my-codex THREAD_ID
+/send 请总结当前项目状态
+```
+
+Once bound, plain text messages are sent to the bound Codex thread. The same thread can be opened locally:
+
+```bash
+codex resume THREAD_ID -C /path/to/project
+```
+
+Wait for the final `Run #... completed` or `Run failed` reply before sending the next prompt. The bot serializes work per Telegram chat/topic and project so one Codex thread is not driven by several concurrent turns.
+
+Useful Telegram commands:
+
+```text
+/binding
+/status
+/sessions
+/sync
+/runs
+/summary
+/new 请开始一个新的 session
+/todo list
+/todo add Run the smoke test
+/todo done 12
+```
+
+Local binding management is also available:
+
+```bash
+mycodex telegram users
+mycodex telegram bindings
+mycodex telegram bind CHAT_ID PROJECT --message-thread-id TOPIC_ID --thread-id THREAD_ID
+mycodex telegram unbind CHAT_ID --message-thread-id TOPIC_ID
+```
+
 ## Safety Model
 
 Projects default to:
