@@ -10,6 +10,7 @@ from mycodex.experiment_ops import (
     _contract_produces_wandb_run,
     _jsonable,
     _run_path_from_launch_or_contract,
+    _ssh_args,
     evaluate_stop_conditions,
     launch_remote_job,
     parse_remote_ref,
@@ -32,6 +33,15 @@ class ExperimentOpsTests(unittest.TestCase):
         self.assertEqual(run_ref.entity, "entity")
         self.assertEqual(run_ref.project, "project")
         self.assertEqual(run_ref.run_id, "run123")
+
+    def test_ssh_args_password_auth_disables_batch_mode(self) -> None:
+        target = parse_remote_ref("root@example.com:2222:/repo")
+        args = _ssh_args(target, None, batch_mode=False, password_auth=True)
+        joined = " ".join(args)
+        self.assertIn("BatchMode=no", joined)
+        self.assertIn("PreferredAuthentications=password", joined)
+        self.assertNotIn("BatchMode=yes", joined)
+        self.assertEqual(args[-2:], ["-p", "2222"])
 
     def test_launch_remote_job_records_pid_and_log_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,6 +89,33 @@ class ExperimentOpsTests(unittest.TestCase):
                 self.assertEqual(updated["artifact_ref"], "/remote/repo/logs/run.log")
                 events = store.list_experiment_events(experiment["id"], limit=5)
                 self.assertEqual(events[0]["event_type"], "remote_job_started")
+
+    def test_launch_remote_job_dry_run_reports_password_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                store.add_project("demo", project_path)
+                store.add_experiment(
+                    1,
+                    name="self-iterate",
+                    thread_id="thread-1",
+                    remote_ref="ma-user@example.com:30415:/remote/repo",
+                    status="running",
+                    config={"ssh_password_file": "/tmp/secret"},
+                )
+
+                result = launch_remote_job(
+                    store,
+                    "demo",
+                    "self-iterate",
+                    command="python train.py",
+                    commit="abc123",
+                    require_clean=False,
+                    dry_run=True,
+                )
+
+                self.assertEqual(result["ssh_auth"], "password_file")
 
     def test_remote_status_uses_latest_remote_job_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

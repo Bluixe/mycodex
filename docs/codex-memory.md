@@ -41,6 +41,9 @@ pitfalls that should be easy to update.
 - Remote experiment launch records PID/log/commit in `remote_job_started`.
   W&B polling records compact `metric` events plus `decision`, `failed`, or
   `wandb_run_finished` events when conditions are reached.
+- Remote experiment commands can use `--ssh-password-file` for password-only
+  servers. Keep the password under ignored local `data/secrets/`, require the
+  local `expect` binary, and record only the auth mode, never the password.
 - Research automation is intentionally split into levels: skills define the
   behavioral protocol, while the L3 `mycodex research` control plane persists
   source, claim, idea, task, and event ledgers around a bound Codex session.

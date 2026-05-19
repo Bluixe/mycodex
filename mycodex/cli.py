@@ -305,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp_launch.add_argument("--command", required=True)
     exp_launch.add_argument("--remote-ref")
     exp_launch.add_argument("--ssh-key")
+    exp_launch.add_argument("--ssh-password-file")
     exp_launch.add_argument("--commit")
     exp_launch.add_argument("--branch")
     exp_launch.add_argument("--allow-dirty", action="store_true")
@@ -325,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp_remote_status.add_argument("--name", required=True)
     exp_remote_status.add_argument("--remote-ref")
     exp_remote_status.add_argument("--ssh-key")
+    exp_remote_status.add_argument("--ssh-password-file")
     exp_remote_status.add_argument("--pid")
     exp_remote_status.add_argument("--log-path")
     exp_remote_status.add_argument("--lines", type=int, default=40)
@@ -361,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp_supervise.add_argument("--complete-on-finish", action="store_true")
     exp_supervise.add_argument("--remote-ref")
     exp_supervise.add_argument("--ssh-key")
+    exp_supervise.add_argument("--ssh-password-file")
     exp_supervise.add_argument("--pid", help="Remote process PID to monitor when the job was attached manually")
     exp_supervise.add_argument("--log-path", help="Remote log path to tail when the job was attached manually")
     exp_supervise.add_argument("--interval", type=int, default=300)
@@ -1068,6 +1071,7 @@ def cmd_experiments_launch_remote(store: Store, args) -> None:
         command=args.command,
         remote_ref=args.remote_ref,
         ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
         commit=args.commit,
         branch=args.branch,
         require_clean=not args.allow_dirty,
@@ -1099,6 +1103,7 @@ def cmd_experiments_remote_status(store: Store, args) -> None:
         args.name,
         remote_ref=args.remote_ref,
         ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
         pid=args.pid,
         log_path=args.log_path,
         lines=args.lines,
@@ -1148,6 +1153,7 @@ def cmd_experiments_supervise(store: Store, args) -> None:
         complete_on_finish=args.complete_on_finish,
         remote_ref=args.remote_ref,
         ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
         remote_pid=args.pid,
         remote_log_path=args.log_path,
         interval=args.interval,

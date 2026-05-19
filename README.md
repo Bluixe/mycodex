@@ -300,6 +300,11 @@ mycodex experiments launch-remote \
   --wandb-run-id RUN_ID
 ```
 
+For password-only machines, keep the password in an ignored local file and pass
+`--ssh-password-file path/to/secret` instead of `--ssh-key`. Password mode uses
+the local `expect` command and records only `ssh_auth=password_file`, never the
+secret value.
+
 `launch-remote` writes `remote_pull_started`, `remote_pull_completed`, and
 `remote_job_started` events. The job-started payload includes the remote PID,
 log path, commit, command, and optional W&B run fields.

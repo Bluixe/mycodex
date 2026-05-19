@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from collections import deque
@@ -227,6 +229,7 @@ def launch_remote_job(
     command: str,
     remote_ref: str | None = None,
     ssh_key: str | None = None,
+    ssh_password_file: str | None = None,
     commit: str | None = None,
     branch: str | None = None,
     require_clean: bool = True,
@@ -253,6 +256,11 @@ def launch_remote_job(
         raise ValueError("remote_ref is not configured for this experiment")
     target = parse_remote_ref(str(resolved_remote_ref))
     resolved_ssh_key = ssh_key or config.get("ssh_key") or os.environ.get("MYCODEX_SSH_KEY")
+    resolved_ssh_password_file = (
+        ssh_password_file
+        or config.get("ssh_password_file")
+        or os.environ.get("MYCODEX_SSH_PASSWORD_FILE")
+    )
     repo = Path(project["path"])
 
     local_status: list[str] = []
@@ -305,6 +313,7 @@ def launch_remote_job(
         "wandb_project": wandb_project,
         "wandb_run_id": wandb_run_id,
         "wandb_run_name": wandb_run_name,
+        "ssh_auth": "password_file" if resolved_ssh_password_file else ("key" if resolved_ssh_key else "default"),
     }
 
     if dry_run:
@@ -331,7 +340,16 @@ def launch_remote_job(
     )
     runner = remote_runner or run_remote_script
     try:
-        result = runner(target, script, str(resolved_ssh_key) if resolved_ssh_key else None, timeout)
+        if remote_runner:
+            result = runner(target, script, str(resolved_ssh_key) if resolved_ssh_key else None, timeout)
+        else:
+            result = run_remote_script(
+                target,
+                script,
+                str(resolved_ssh_key) if resolved_ssh_key else None,
+                timeout,
+                ssh_password_file=str(resolved_ssh_password_file) if resolved_ssh_password_file else None,
+            )
     except Exception as exc:
         store.add_experiment_event(
             experiment["id"],
@@ -397,6 +415,7 @@ def remote_job_status(
     *,
     remote_ref: str | None = None,
     ssh_key: str | None = None,
+    ssh_password_file: str | None = None,
     pid: str | None = None,
     log_path: str | None = None,
     lines: int = 40,
@@ -412,13 +431,27 @@ def remote_job_status(
         raise ValueError("remote_ref is not configured for this experiment")
     target = parse_remote_ref(str(resolved_remote_ref))
     resolved_ssh_key = ssh_key or config.get("ssh_key") or os.environ.get("MYCODEX_SSH_KEY")
+    resolved_ssh_password_file = (
+        ssh_password_file
+        or config.get("ssh_password_file")
+        or os.environ.get("MYCODEX_SSH_PASSWORD_FILE")
+    )
     resolved_pid = str(pid or latest_job.get("remote_pid") or "")
     resolved_log = str(log_path or latest_job.get("log_path") or "")
     if not resolved_pid:
         raise ValueError("remote PID is required; pass --pid or launch a remote job first")
     script = _remote_status_script(resolved_pid, resolved_log, max(1, lines))
     runner = remote_runner or run_remote_script
-    result = runner(target, script, str(resolved_ssh_key) if resolved_ssh_key else None, timeout)
+    if remote_runner:
+        result = runner(target, script, str(resolved_ssh_key) if resolved_ssh_key else None, timeout)
+    else:
+        result = run_remote_script(
+            target,
+            script,
+            str(resolved_ssh_key) if resolved_ssh_key else None,
+            timeout,
+            ssh_password_file=str(resolved_ssh_password_file) if resolved_ssh_password_file else None,
+        )
     parsed = _parse_key_values(result.stdout)
     status = parsed.get("REMOTE_STATUS") or "unknown"
     level = "info" if status == "running" else "warning"
@@ -432,6 +465,7 @@ def remote_job_status(
             "remote_pid": resolved_pid,
             "log_path": resolved_log,
             "status": status,
+            "ssh_auth": "password_file" if resolved_ssh_password_file else ("key" if resolved_ssh_key else "default"),
             "stdout": result.stdout,
             "stderr": result.stderr,
         },
@@ -638,6 +672,7 @@ def supervise_experiment(
     complete_on_finish: bool = False,
     remote_ref: str | None = None,
     ssh_key: str | None = None,
+    ssh_password_file: str | None = None,
     remote_pid: str | None = None,
     remote_log_path: str | None = None,
     interval: int = 300,
@@ -711,6 +746,7 @@ def supervise_experiment(
                 experiment_name,
                 remote_ref=remote_ref,
                 ssh_key=ssh_key,
+                ssh_password_file=ssh_password_file,
                 pid=current_remote_pid,
                 log_path=current_remote_log_path,
                 lines=120,
@@ -857,6 +893,7 @@ def supervise_experiment(
                 experiment_name,
                 contract,
                 ssh_key=ssh_key,
+                ssh_password_file=ssh_password_file,
                 remote_ref=remote_ref,
                 allow_full_train=allow_full_train,
             )
@@ -915,6 +952,7 @@ def execute_execution_contract(
     contract: dict[str, Any],
     *,
     ssh_key: str | None = None,
+    ssh_password_file: str | None = None,
     remote_ref: str | None = None,
     allow_full_train: bool = False,
 ) -> dict[str, Any]:
@@ -1027,6 +1065,7 @@ def execute_execution_contract(
             command=command,
             remote_ref=remote_ref,
             ssh_key=ssh_key,
+            ssh_password_file=ssh_password_file,
             commit=commit,
             require_clean=False,
             env=remote.get("env") if isinstance(remote.get("env"), dict) else {},
@@ -1137,7 +1176,12 @@ def run_remote_script(
     script: str,
     ssh_key: str | None,
     timeout: int,
+    *,
+    ssh_password_file: str | None = None,
 ) -> RemoteExecResult:
+    if ssh_password_file:
+        return _run_remote_script_with_password(target, script, ssh_password_file, timeout)
+
     args = _ssh_args(target, ssh_key)
     args.extend([target.login, "bash", "-s"])
     completed = subprocess.run(
@@ -1148,6 +1192,77 @@ def run_remote_script(
         timeout=timeout,
         check=False,
     )
+    result = RemoteExecResult(
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        returncode=completed.returncode,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RemoteCommandError(f"remote command failed with exit {completed.returncode}: {detail}", result)
+    return result
+
+
+def _run_remote_script_with_password(
+    target: RemoteTarget,
+    script: str,
+    ssh_password_file: str,
+    timeout: int,
+) -> RemoteExecResult:
+    expect_bin = shutil.which("expect")
+    if not expect_bin:
+        raise RuntimeError("password SSH requires `expect` to be installed")
+
+    password_path = Path(ssh_password_file).expanduser()
+    if not password_path.exists():
+        raise FileNotFoundError(f"SSH password file not found: {password_path}")
+
+    encoded_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    remote_command = f"printf %s {shlex.quote(encoded_script)} | base64 -d | bash"
+    args = _ssh_args(target, None, batch_mode=False, password_auth=True)
+    args.extend([target.login, remote_command])
+
+    expect_script = r"""
+set timeout $env(MYCODEX_REMOTE_TIMEOUT)
+set password_file $env(MYCODEX_SSH_PASSWORD_FILE)
+
+set pf [open $password_file r]
+set password [string trim [read $pf]]
+close $pf
+
+spawn -noecho /bin/sh -c $env(MYCODEX_EXPECT_SSH_COMMAND)
+expect {
+  "*Are you sure you want to continue connecting*" {
+    send "yes\r"
+    exp_continue
+  }
+  "*password:*" {
+    send -- "$password\r"
+    exp_continue
+  }
+  timeout {
+    exit 124
+  }
+  eof {}
+}
+catch wait result
+exit [lindex $result 3]
+"""
+    env = {
+        **os.environ,
+        "MYCODEX_REMOTE_TIMEOUT": str(max(1, timeout)),
+        "MYCODEX_SSH_PASSWORD_FILE": str(password_path),
+        "MYCODEX_EXPECT_SSH_COMMAND": shlex.join(args),
+    }
+    completed = subprocess.run(
+        [expect_bin, "-c", expect_script, *args],
+        text=True,
+        capture_output=True,
+        timeout=timeout + 10,
+        check=False,
+        env=env,
+    )
+
     result = RemoteExecResult(
         stdout=completed.stdout,
         stderr=completed.stderr,
@@ -1230,8 +1345,27 @@ fi
 """
 
 
-def _ssh_args(target: RemoteTarget, ssh_key: str | None) -> list[str]:
-    args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+def _ssh_args(
+    target: RemoteTarget,
+    ssh_key: str | None,
+    *,
+    batch_mode: bool = True,
+    password_auth: bool = False,
+) -> list[str]:
+    args = ["ssh", "-o", "ConnectTimeout=10"]
+    if batch_mode:
+        args.extend(["-o", "BatchMode=yes"])
+    if password_auth:
+        args.extend([
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+        ])
     if ssh_key:
         args.extend(["-i", str(Path(ssh_key).expanduser()), "-o", "IdentitiesOnly=yes"])
     if target.port is not None:
