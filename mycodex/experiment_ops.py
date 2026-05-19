@@ -65,6 +65,7 @@ _COND_RE = re.compile(
     r"(?P<op>>=|<=|==|!=|>|<)\s*"
     r"(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$"
 )
+_PASSWORD_PROMPT_RE = re.compile(r"^[^\r\n]*password:\s*[\r\n]*", re.IGNORECASE | re.MULTILINE)
 
 LOW_RISK_EXECUTION_CLASSES = {
     "read-only-preflight",
@@ -1198,9 +1199,13 @@ def run_remote_script(
         returncode=completed.returncode,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+        detail = result.stderr.strip() or result.stdout.strip()
         raise RemoteCommandError(f"remote command failed with exit {completed.returncode}: {detail}", result)
     return result
+
+
+def _strip_password_prompts(text: str) -> str:
+    return _PASSWORD_PROMPT_RE.sub("", text)
 
 
 def _run_remote_script_with_password(
@@ -1264,12 +1269,12 @@ exit [lindex $result 3]
     )
 
     result = RemoteExecResult(
-        stdout=completed.stdout,
-        stderr=completed.stderr,
+        stdout=_strip_password_prompts(completed.stdout),
+        stderr=_strip_password_prompts(completed.stderr),
         returncode=completed.returncode,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+        detail = result.stderr.strip() or result.stdout.strip()
         raise RemoteCommandError(f"remote command failed with exit {completed.returncode}: {detail}", result)
     return result
 
@@ -1339,7 +1344,14 @@ fi
 printf 'REMOTE_STATUS=%s\\n' "$STATUS"
 if [ -n "$LOG_PATH" ] && [ -f "$LOG_PATH" ]; then
   printf 'REMOTE_LOG_TAIL_START\\n'
-  tail -n "$LINES" "$LOG_PATH" || true
+  tail -n "$((LINES * 5))" "$LOG_PATH" \
+    | tr '\\r' '\\n' \
+    | awk '
+        /[0-9]+%\\|/ || /it\\/s/ {{ next }}
+        length($0) > 1000 {{ print substr($0, 1, 1000) "..."; next }}
+        {{ print }}
+      ' \
+    | tail -n "$LINES" || true
   printf 'REMOTE_LOG_TAIL_END\\n'
 fi
 """

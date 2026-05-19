@@ -10,7 +10,9 @@ from mycodex.experiment_ops import (
     _contract_produces_wandb_run,
     _jsonable,
     _run_path_from_launch_or_contract,
+    _remote_status_script,
     _ssh_args,
+    _strip_password_prompts,
     evaluate_stop_conditions,
     launch_remote_job,
     parse_remote_ref,
@@ -42,6 +44,17 @@ class ExperimentOpsTests(unittest.TestCase):
         self.assertIn("PreferredAuthentications=password", joined)
         self.assertNotIn("BatchMode=yes", joined)
         self.assertEqual(args[-2:], ["-p", "2222"])
+
+    def test_remote_status_tail_filters_progress_noise(self) -> None:
+        script = _remote_status_script("123", "/tmp/run.log", 40)
+        self.assertIn("tr '\\r' '\\n'", script)
+        self.assertIn("/[0-9]+%\\|/ || /it\\/s/ { next }", script)
+        self.assertIn("length($0) > 1000", script)
+
+    def test_strip_password_prompt_output(self) -> None:
+        output = "root@example.com's password: \r\nREMOTE_STATUS=running\n"
+        self.assertEqual(_strip_password_prompts(output), "REMOTE_STATUS=running\n")
+        self.assertEqual(_strip_password_prompts("password: REMOTE_STATUS=running\n"), "REMOTE_STATUS=running\n")
 
     def test_launch_remote_job_records_pid_and_log_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
