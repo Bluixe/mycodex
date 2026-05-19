@@ -13,6 +13,9 @@ dependencies = [
     "jinja2>=3.1",
 ]
 
+[project.optional-dependencies]
+wandb = ["wandb>=0.16"]
+
 [project.scripts]
 mycodex = "mycodex.cli:main"
 

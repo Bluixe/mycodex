@@ -4,12 +4,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ page_title }} - mycodex</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-    <script defer src="{{ url_for('static', path='app.js') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ assets_version }}">
+    <script defer src="{{ url_for('static', path='app.js') }}?v={{ assets_version }}"></script>
   </head>
   <body data-refresh-interval="{{ refresh_interval_ms|default(0) }}">
     <header class="topbar">
       <a class="brand" href="/">mycodex</a>
+      <nav class="topnav">
+        <a href="/">Projects</a>
+        <a href="/usage">Token Usage</a>
+      </nav>
       <div class="meta">
         <span>{{ db_path }}</span>
       </div>

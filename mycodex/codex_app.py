@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 class CodexAppServerError(RuntimeError):
@@ -265,6 +265,7 @@ class CodexAppServerClient:
         thread_id: str,
         turn_id: str | None,
         timeout: int,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> TurnResult:
         deadline = time.monotonic() + timeout
         deltas: list[str] = []
@@ -278,6 +279,8 @@ class CodexAppServerClient:
             if self._is_server_request(event):
                 self._auto_respond_to_server_request(event)
                 continue
+            if on_event is not None:
+                on_event(event)
             method = event.get("method")
             params = event.get("params") or {}
             if method == "item/agentMessage/delta":

@@ -7,3 +7,4 @@ venv/
 data/
 logs/
 *.egg-info/
+:memory:

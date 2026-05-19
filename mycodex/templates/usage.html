@@ -1,0 +1,254 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <div class="crumb"><a href="/">Projects</a> / Token Usage</div>
+    <h1>Token Usage</h1>
+    <p>Local Codex client usage from <code>{{ snapshot.source }}</code>.</p>
+  </div>
+  <div class="timestamp">Updated {{ snapshot.generated_at|ts }}</div>
+</section>
+
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <h2>Window</h2>
+      <p class="muted">This is local telemetry from this machine, not final billing or plan-limit authority.</p>
+    </div>
+    <div class="actions compact">
+      {% for option in [1, 7, 30] %}
+      <a class="button {{ 'secondary' if option != snapshot.window_days else '' }}" href="/usage?days={{ option }}">{{ option }}d</a>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if snapshot.error %}
+  <p class="empty-note">{{ snapshot.error }}</p>
+  {% endif %}
+
+  <div class="usage-grid">
+    <div class="usage-stat">
+      <span class="label">Total tokens</span>
+      <strong>{{ snapshot.summary.total_tokens|compact_int }}</strong>
+      <span>{{ snapshot.summary.total_tokens|format_int }}</span>
+    </div>
+    <div class="usage-stat">
+      <span class="label">Input</span>
+      <strong>{{ snapshot.summary.input_tokens|compact_int }}</strong>
+      <span>cached {{ snapshot.summary.cached_tokens|compact_int }}</span>
+    </div>
+    <div class="usage-stat">
+      <span class="label">Output</span>
+      <strong>{{ snapshot.summary.output_tokens|compact_int }}</strong>
+      <span>reasoning {{ snapshot.summary.reasoning_tokens|compact_int }}</span>
+    </div>
+    <div class="usage-stat">
+      <span class="label">Responses</span>
+      <strong>{{ snapshot.summary.events|compact_int }}</strong>
+      <span>{{ snapshot.unmapped_count }} unmapped</span>
+    </div>
+  </div>
+</section>
+
+<section class="visual-grid">
+  <section class="panel chart-panel">
+    <div class="section-head">
+      <div>
+        <h2>Token Trend</h2>
+        <p class="muted">Total tokens by hour or by day.</p>
+      </div>
+      <div class="segmented" aria-label="Token trend granularity">
+        <button type="button" class="segmented-button is-active" data-chart-toggle="hourly">Hourly</button>
+        <button type="button" class="segmented-button" data-chart-toggle="daily">Daily</button>
+      </div>
+    </div>
+
+    <div class="chart-pane" data-chart-panel="hourly">
+      <div class="chart-frame">
+        <div class="chart-axis" aria-hidden="true">
+          <span>{{ snapshot.hour_axis.max_label }}</span>
+          <span>{{ snapshot.hour_axis.mid_label }}</span>
+          <span>0</span>
+        </div>
+        <div class="bar-chart" aria-label="Hourly token usage">
+        {% for row in snapshot.by_hour %}
+        <div class="bar-slot" tabindex="0" aria-label="{{ row.name }} total {{ row.total_tokens|format_int }} tokens">
+          <div class="bar-track">
+            <div class="bar-value" style="height: {{ row.height_pct }}%"></div>
+          </div>
+          <div class="bar-tooltip">
+            <strong>{{ row.name }}</strong>
+            <span>Total {{ row.total_tokens|format_int }}</span>
+            <span>Input {{ row.input_tokens|format_int }}</span>
+            <span>Output {{ row.output_tokens|format_int }}</span>
+            <span>{{ row.events }} response(s)</span>
+          </div>
+          <span class="bar-label">{{ row.label }}</span>
+        </div>
+        {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-pane hidden" data-chart-panel="daily">
+      <div class="chart-frame">
+        <div class="chart-axis" aria-hidden="true">
+          <span>{{ snapshot.day_axis.max_label }}</span>
+          <span>{{ snapshot.day_axis.mid_label }}</span>
+          <span>0</span>
+        </div>
+        <div class="bar-chart" aria-label="Daily token usage">
+        {% for row in snapshot.by_day %}
+        <div class="bar-slot" tabindex="0" aria-label="{{ row.name }} total {{ row.total_tokens|format_int }} tokens">
+          <div class="bar-track">
+            <div class="bar-value" style="height: {{ row.height_pct }}%"></div>
+          </div>
+          <div class="bar-tooltip">
+            <strong>{{ row.name }}</strong>
+            <span>Total {{ row.total_tokens|format_int }}</span>
+            <span>Input {{ row.input_tokens|format_int }}</span>
+            <span>Output {{ row.output_tokens|format_int }}</span>
+            <span>{{ row.events }} response(s)</span>
+          </div>
+          <span class="bar-label">{{ row.label }}</span>
+        </div>
+        {% endfor %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel chart-panel">
+    <h2>Project Share</h2>
+    {% if snapshot.project_pie %}
+    <div class="pie-layout">
+      <div class="pie-chart" style="--pie: {{ snapshot.project_pie_gradient|safe }}" aria-label="Project token share"></div>
+      <ul class="pie-legend">
+        {% for row in snapshot.project_pie %}
+        <li>
+          <span class="swatch" style="background: {{ row.color }}"></span>
+          <span class="legend-name">{{ row.name }}</span>
+          <strong>{{ row.percent }}%</strong>
+          <span>{{ row.total_tokens|compact_int }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% else %}
+    <p class="muted">No project usage in this window.</p>
+    {% endif %}
+  </section>
+</section>
+
+<section class="usage-layout">
+  <div class="main-column">
+    <section class="panel">
+      <h2>By Project</h2>
+      {% if snapshot.by_project %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Project</th><th>Total</th><th>Input</th><th>Output</th><th>Responses</th><th>Latest</th></tr>
+          </thead>
+          <tbody>
+            {% for row in snapshot.by_project %}
+            <tr>
+              <td>
+                {% if row.name != "Unmapped" %}
+                <a href="/projects/{{ row.name }}">{{ row.name }}</a>
+                {% else %}
+                {{ row.name }}
+                {% endif %}
+              </td>
+              <td>{{ row.total_tokens|compact_int }}</td>
+              <td>{{ row.input_tokens|compact_int }}</td>
+              <td>{{ row.output_tokens|compact_int }}</td>
+              <td>{{ row.events }}</td>
+              <td>{{ row.latest_ts|ts }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No usage events in this window.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Recent Responses</h2>
+      {% if snapshot.recent %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Project</th><th>Model</th><th>Total</th><th>Input</th><th>Output</th><th>Thread</th></tr>
+          </thead>
+          <tbody>
+            {% for event in snapshot.recent %}
+            <tr>
+              <td>{{ event.ts|ts }}</td>
+              <td>{{ event.project }}</td>
+              <td><code>{{ event.model }}</code></td>
+              <td>{{ event.total_tokens|compact_int }}</td>
+              <td>{{ event.input_tokens|compact_int }}</td>
+              <td>{{ event.output_tokens|compact_int }}</td>
+              <td><code>{{ event.thread_id or "-" }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No recent usage events.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <aside class="side-column">
+    <section class="panel">
+      <h2>By Model</h2>
+      {% if snapshot.by_model %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Total</th><th>Responses</th></tr>
+          </thead>
+          <tbody>
+            {% for row in snapshot.by_model %}
+            <tr>
+              <td><code>{{ row.name }}</code></td>
+              <td>{{ row.total_tokens|compact_int }}</td>
+              <td>{{ row.events }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No model usage yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>By Day</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Day</th><th>Total</th><th>Responses</th></tr>
+          </thead>
+          <tbody>
+            {% for row in snapshot.by_day %}
+            <tr>
+              <td>{{ row.name }}</td>
+              <td>{{ row.total_tokens|compact_int }}</td>
+              <td>{{ row.events }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </aside>
+</section>
+{% endblock %}

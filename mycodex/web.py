@@ -19,6 +19,7 @@ from .status import (
     rule_schedule_label,
     snapshot_to_jsonable,
 )
+from .token_usage import token_usage_snapshot
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -36,11 +37,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     templates.env.filters["ts"] = format_ts
     templates.env.filters["schedule"] = rule_schedule_label
     templates.env.filters["priority"] = _priority_label
+    templates.env.filters["compact_int"] = _compact_int
+    templates.env.filters["format_int"] = _format_int
 
     def render(request: Request, template: str, context: dict[str, Any]) -> HTMLResponse:
         base_context = {
             "request": request,
             "db_path": str(resolved_db_path),
+            "assets_version": "20260515-daily-summary-notify",
         }
         base_context.update(context)
         return templates.TemplateResponse(request, template, base_context)
@@ -90,6 +94,21 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 "run": snapshot_to_jsonable(run),
                 "page_title": f"Run #{run_id}",
                 "refresh_interval_ms": 5000 if run["status"] == "running" else 0,
+            },
+        )
+
+    @app.get("/usage", response_class=HTMLResponse)
+    def usage(request: Request, days: int = 7):
+        days = _bounded_days(days)
+        with Store(resolved_db_path) as store:
+            snapshot = token_usage_snapshot(store, days=days)
+        return render(
+            request,
+            "usage.html",
+            {
+                "snapshot": snapshot,
+                "page_title": "Token Usage",
+                "refresh_interval_ms": 10000,
             },
         )
 
@@ -163,6 +182,123 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if run is None:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse(snapshot_to_jsonable(run))
+
+    @app.get("/api/projects/{project_name}/experiments")
+    def api_experiments(project_name: str):
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            experiments = store.list_experiments(project["id"])
+        return JSONResponse(snapshot_to_jsonable(experiments))
+
+    @app.get("/api/projects/{project_name}/experiments/{experiment_name}")
+    def api_experiment(project_name: str, experiment_name: str, limit: int = 20):
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            experiment = store.get_experiment(project["id"], experiment_name)
+            if experiment is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            events = store.list_experiment_events(experiment["id"], limit=max(1, min(limit, 100)))
+        return JSONResponse(
+            {
+                "experiment": snapshot_to_jsonable(experiment),
+                "events": snapshot_to_jsonable(events),
+            }
+        )
+
+    @app.get("/api/projects/{project_name}/research")
+    def api_research_threads(project_name: str):
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            threads = store.list_research_threads(project["id"])
+        return JSONResponse(snapshot_to_jsonable(threads))
+
+    @app.get("/api/projects/{project_name}/research/{research_name}")
+    def api_research_thread(project_name: str, research_name: str, limit: int = 20):
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            research = store.get_research_thread(project["id"], research_name)
+            if research is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            limit = max(1, min(limit, 100))
+            events = store.list_research_events(research["id"], limit=limit)
+            sources = store.list_research_sources(research["id"], limit=limit)
+            claims = store.list_research_claims(research["id"], limit=limit)
+            ideas = store.list_research_ideas(research["id"], limit=limit)
+            tasks = store.list_research_tasks(research["id"], limit=limit)
+        return JSONResponse(
+            {
+                "research": snapshot_to_jsonable(research),
+                "events": snapshot_to_jsonable(events),
+                "sources": snapshot_to_jsonable(sources),
+                "claims": snapshot_to_jsonable(claims),
+                "ideas": snapshot_to_jsonable(ideas),
+                "tasks": snapshot_to_jsonable(tasks),
+            }
+        )
+
+    @app.post("/api/projects/{project_name}/research/{research_name}/events")
+    async def api_research_event(project_name: str, research_name: str, request: Request):
+        data = await request.json()
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            research = store.get_research_thread(project["id"], research_name)
+            if research is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            event_id = store.add_research_event(
+                research["id"],
+                event_type=str(data.get("event_type") or data.get("type") or ""),
+                iteration=_coerce_optional_int(data.get("iteration")),
+                level=str(data.get("level") or "info"),
+                message=str(data.get("message") or ""),
+                payload=data.get("payload") if isinstance(data.get("payload"), dict) else {},
+                source=str(data.get("source") or "api"),
+                run_id=_coerce_optional_int(data.get("run_id")),
+                status=data.get("status"),
+                phase=data.get("phase"),
+                phase_message=data.get("phase_message"),
+            )
+        return JSONResponse({"event_id": event_id})
+
+    @app.post("/api/projects/{project_name}/experiments/{experiment_name}/events")
+    async def api_experiment_event(project_name: str, experiment_name: str, request: Request):
+        data = await request.json()
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            if project is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            experiment = store.get_experiment(project["id"], experiment_name)
+            if experiment is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            event_id = store.add_experiment_event(
+                experiment["id"],
+                event_type=str(data.get("event_type") or data.get("type") or ""),
+                iteration=_coerce_optional_int(data.get("iteration")),
+                level=str(data.get("level") or "info"),
+                message=str(data.get("message") or ""),
+                payload=data.get("payload") if isinstance(data.get("payload"), dict) else {},
+                source=str(data.get("source") or "api"),
+                run_id=_coerce_optional_int(data.get("run_id")),
+                status=data.get("status"),
+                phase=data.get("phase"),
+                phase_message=data.get("phase_message"),
+            )
+        return JSONResponse({"event_id": event_id})
+
+    @app.get("/api/usage")
+    def api_usage(days: int = 7):
+        days = _bounded_days(days)
+        with Store(resolved_db_path) as store:
+            return JSONResponse(token_usage_snapshot(store, days=days))
 
     return app
 
@@ -244,3 +380,42 @@ def _priority_label(priority: int | str | None) -> str:
         return labels.get(int(priority or 2), "normal")
     except (TypeError, ValueError):
         return "normal"
+
+
+def _compact_int(value: int | str | None) -> str:
+    number = _coerce_int(value)
+    if abs(number) >= 1_000_000_000:
+        return f"{number / 1_000_000_000:.1f}B"
+    if abs(number) >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if abs(number) >= 10_000:
+        return f"{number / 1_000:.1f}K"
+    return f"{number:,}"
+
+
+def _format_int(value: int | str | None) -> str:
+    return f"{_coerce_int(value):,}"
+
+
+def _coerce_int(value: int | str | None) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_optional_int(value: int | str | None) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_days(days: int | str | None) -> int:
+    try:
+        value = int(days or 7)
+    except (TypeError, ValueError):
+        value = 7
+    return max(1, min(value, 30))

@@ -19,6 +19,7 @@ from .status import project_snapshot, snapshot_to_jsonable
 
 
 TELEGRAM_MAX_MESSAGE = 4096
+DEFAULT_TOKEN_FILE = Path("data/secrets/telegram_bot_token")
 HELP_TEXT = """mycodex Telegram commands:
 /projects - list mycodex projects
 /bind PROJECT [THREAD_ID] - bind this chat/topic to a project and optional Codex thread
@@ -621,6 +622,61 @@ class TelegramBot:
                 self._active_bindings.discard(binding_key)
 
 
+def notify_project_bindings(
+    store: Store,
+    project_id: int,
+    text: str,
+    *,
+    token: str | None = None,
+    token_file: str | Path | None = None,
+    token_env: str = "MYCODEX_TELEGRAM_BOT_TOKEN",
+    proxy_url: str | None = None,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    bindings = [
+        {key: binding[key] for key in binding.keys()}
+        for binding in store.list_telegram_bindings()
+        if binding["project_id"] == project_id
+    ]
+    result: dict[str, Any] = {
+        "attempted": len(bindings),
+        "sent": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    if not bindings:
+        return result
+    if client is None:
+        resolved_token = token_from_sources(
+            token=token,
+            token_file=token_file,
+            token_env=token_env,
+            db_path=store.path,
+            require=False,
+        )
+        if not resolved_token:
+            result["skipped"] = len(bindings)
+            result["errors"].append(
+                f"missing Telegram bot token; set {token_env} or create "
+                f"{default_token_file(store.path)}"
+            )
+            return result
+        client = TelegramClient(resolved_token, proxy_url=proxy_url)
+    for binding in bindings:
+        try:
+            client.send_chunks(
+                binding["chat_id"],
+                text,
+                message_thread_id=binding["message_thread_id"] or None,
+            )
+            result["sent"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                f"chat={binding['chat_id']} topic={binding['message_thread_id'] or '-'}: {exc}"
+            )
+    return result
+
+
 def parse_command(text: str) -> tuple[str, str] | None:
     text = text.strip()
     if not text.startswith("/"):
@@ -663,3 +719,46 @@ def token_from_env(env_name: str) -> str:
     if not token:
         raise ValueError(f"missing Telegram bot token; set {env_name}")
     return token
+
+
+def token_from_file(path: str | Path) -> str:
+    token_path = Path(path).expanduser()
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        raise ValueError(f"Telegram bot token file does not exist: {token_path}") from exc
+    if not token:
+        raise ValueError(f"Telegram bot token file is empty: {token_path}")
+    return token
+
+
+def token_from_sources(
+    *,
+    token: str | None = None,
+    token_file: str | Path | None = None,
+    token_env: str = "MYCODEX_TELEGRAM_BOT_TOKEN",
+    db_path: str | Path | None = None,
+    require: bool = True,
+) -> str | None:
+    if token:
+        return token
+    if token_file:
+        return token_from_file(token_file)
+    env_token = os.environ.get(token_env)
+    if env_token:
+        return env_token
+    default_path = default_token_file(db_path)
+    if default_path.exists():
+        return token_from_file(default_path)
+    if require:
+        raise ValueError(
+            f"missing Telegram bot token; pass --token, pass --token-file, set {token_env}, "
+            f"or create {default_path}"
+        )
+    return None
+
+
+def default_token_file(db_path: str | Path | None = None) -> Path:
+    if db_path is None:
+        return DEFAULT_TOKEN_FILE
+    return Path(db_path).expanduser().resolve().parent / "secrets" / "telegram_bot_token"

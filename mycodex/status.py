@@ -32,13 +32,23 @@ def project_snapshot(
     sessions = store.list_sessions(project["id"])
     runs = store.list_runs(project["id"], limit=10 if include_detail else 5)
     rules = store.list_rules(project["id"])
+    experiments = store.list_experiments(project["id"])
+    research_threads = store.list_research_threads(project["id"])
     todos = store.list_todos(
         project["id"],
         include_archived=include_detail,
         limit=None if include_detail else 8,
     )
     git = git_snapshot(project["path"])
-    health = derive_health(project, sessions, runs, todos, git)
+    health = derive_health(project, sessions, runs, todos, experiments, research_threads, git)
+    experiment_events = {
+        str(experiment["id"]): store.list_experiment_events(experiment["id"], limit=3)
+        for experiment in experiments
+    }
+    research_events = {
+        str(research["id"]): store.list_research_events(research["id"], limit=3)
+        for research in research_threads
+    }
     return {
         "project": project,
         "git": git,
@@ -48,6 +58,16 @@ def project_snapshot(
         "sessions": sessions if include_detail else [],
         "runs": runs,
         "rules": rules,
+        "experiments": experiments,
+        "experiment_events": experiment_events,
+        "research_threads": research_threads,
+        "research_events": research_events,
+        "active_experiment_count": sum(
+            1 for row in experiments if row["status"] in {"planned", "running", "paused"}
+        ),
+        "active_research_count": sum(
+            1 for row in research_threads if row["status"] in {"planned", "running", "paused"}
+        ),
         "todos": todos,
         "todo_counts": dict(Counter(row["status"] for row in todos)),
         "open_todo_count": sum(1 for row in todos if row["status"] in {"open", "doing", "blocked"}),
@@ -56,7 +76,7 @@ def project_snapshot(
     }
 
 
-def derive_health(project, sessions, runs, todos, git: dict[str, str]) -> dict[str, Any]:
+def derive_health(project, sessions, runs, todos, experiments, research_threads, git: dict[str, str]) -> dict[str, Any]:
     reasons: list[str] = []
     severity = "ok"
     label = "ok"
@@ -90,6 +110,20 @@ def derive_health(project, sessions, runs, todos, git: dict[str, str]) -> dict[s
             severity = "warning"
             label = "blocked"
         reasons.append(f"{len(blocked)} todo(s) are blocked.")
+
+    running_experiments = [experiment for experiment in experiments if experiment["status"] == "running"]
+    if running_experiments:
+        if severity == "ok":
+            severity = "info"
+            label = "experiment running"
+        reasons.append(f"{len(running_experiments)} experiment(s) are running.")
+
+    running_research = [research for research in research_threads if research["status"] == "running"]
+    if running_research:
+        if severity == "ok":
+            severity = "info"
+            label = "research running"
+        reasons.append(f"{len(running_research)} research thread(s) are running.")
 
     if git["state"] == "git" and int(git.get("dirty_count") or "0") > 0:
         reasons.append(f"Git worktree has {git['dirty_count']} changed file(s).")

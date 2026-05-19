@@ -47,6 +47,133 @@
       </ul>
     </section>
 
+    <section class="panel" id="daily-summary">
+      {% set latest_summary = snapshot.daily_summary.latest %}
+      <div class="section-head">
+        <h2>Latest Daily Summary</h2>
+        {% if latest_summary %}
+        <span class="badge {{ 'danger' if latest_summary.status == 'failed' else 'info' if latest_summary.status == 'running' else 'ok' }}">{{ latest_summary.status }}</span>
+        {% else %}
+        <span class="muted">{{ "scheduled" if snapshot.daily_summary.enabled else "off" }}</span>
+        {% endif %}
+      </div>
+      {% if latest_summary %}
+      <div class="summary-meta">
+        <span><a href="/runs/{{ latest_summary.id }}">Run #{{ latest_summary.id }}</a></span>
+        <span>{{ latest_summary.started_at|ts }}</span>
+        <span>thread <code>{{ latest_summary.thread_id or "-" }}</code></span>
+      </div>
+      {% if latest_summary.output_text %}
+      <pre class="summary-output">{{ latest_summary.output_text[:2400] }}{% if latest_summary.output_text|length > 2400 %}
+
+... open Run #{{ latest_summary.id }} for the full summary.{% endif %}</pre>
+      {% elif latest_summary.error %}
+      <pre class="summary-output error">{{ latest_summary.error }}</pre>
+      {% else %}
+      <p class="muted">No output has been recorded yet.</p>
+      {% endif %}
+      {% else %}
+      <p class="muted">
+        No daily summary has been recorded. Next due:
+        {{ snapshot.daily_summary.next_due_text }}.
+      </p>
+      {% endif %}
+    </section>
+
+    <section class="panel" id="experiments">
+      <div class="section-head">
+        <h2>Experiments</h2>
+        <span>{{ snapshot.active_experiment_count }} active</span>
+      </div>
+      {% if snapshot.experiments %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Now</th><th>Iteration</th><th>Updated</th><th>Thread</th></tr>
+          </thead>
+          <tbody>
+            {% for experiment in snapshot.experiments %}
+            <tr class="{{ 'muted-row' if experiment.status in ['completed', 'archived'] else '' }}">
+              <td>
+                <strong>{{ experiment.name }}</strong>
+                {% if experiment.objective %}<p>{{ experiment.objective }}</p>{% endif %}
+                {% if experiment.latest_decision %}
+                <p><strong>Decision:</strong> {{ experiment.latest_decision }}</p>
+                {% endif %}
+                {% if experiment.last_metric_json and experiment.last_metric_json != '{}' %}
+                <p class="muted">Metric: <code>{{ experiment.last_metric_json }}</code></p>
+                {% endif %}
+                {% if experiment.artifact_ref %}
+                <p class="muted">Artifact: <code>{{ experiment.artifact_ref }}</code></p>
+                {% endif %}
+                {% set events = snapshot.experiment_events.get(experiment.id|string, []) %}
+                {% if events %}
+                <p class="muted">
+                  Latest: {{ events[0].event_type }} · {{ events[0].message or events[0].created_at|ts }}
+                </p>
+                {% endif %}
+              </td>
+              <td>
+                <span class="pill">{{ experiment.phase }}</span>
+                <p>{{ experiment.phase_message or experiment.status }}</p>
+              </td>
+              <td>{{ experiment.current_iteration }}/{{ experiment.max_iterations or "-" }}</td>
+              <td>{{ experiment.updated_at|ts }}</td>
+              <td><code>{{ experiment.thread_id }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No experiments recorded.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel" id="research">
+      <div class="section-head">
+        <h2>Research</h2>
+        <span>{{ snapshot.active_research_count }} active</span>
+      </div>
+      {% if snapshot.research_threads %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Now</th><th>Iteration</th><th>Updated</th><th>Thread</th></tr>
+          </thead>
+          <tbody>
+            {% for research in snapshot.research_threads %}
+            <tr class="{{ 'muted-row' if research.status in ['completed', 'archived'] else '' }}">
+              <td>
+                <strong>{{ research.name }}</strong>
+                {% if research.question %}<p>{{ research.question }}</p>{% endif %}
+                {% if research.latest_decision %}
+                <p><strong>Decision:</strong> {{ research.latest_decision }}</p>
+                {% endif %}
+                {% set events = snapshot.research_events.get(research.id|string, []) %}
+                {% if events %}
+                <p class="muted">
+                  Latest: {{ events[0].event_type }} · {{ events[0].message or events[0].created_at|ts }}
+                </p>
+                {% endif %}
+              </td>
+              <td>
+                <span class="pill">{{ research.phase }}</span>
+                <p>{{ research.phase_message or research.status }}</p>
+              </td>
+              <td>{{ research.current_iteration }}/{{ research.max_iterations or "-" }}</td>
+              <td>{{ research.updated_at|ts }}</td>
+              <td><code>{{ research.thread_id }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">No research threads recorded.</p>
+      {% endif %}
+    </section>
+
     <section class="panel" id="todos">
       <div class="section-head">
         <h2>Todos</h2>
