@@ -92,6 +92,7 @@ class ExperimentOpsTests(unittest.TestCase):
                     wandb_entity="entity",
                     wandb_project="project",
                     wandb_run_id="run123",
+                    post_launch_check_delay=-1,
                     remote_runner=runner,
                 )
 
@@ -102,6 +103,59 @@ class ExperimentOpsTests(unittest.TestCase):
                 self.assertEqual(updated["artifact_ref"], "/remote/repo/logs/run.log")
                 events = store.list_experiment_events(experiment["id"], limit=5)
                 self.assertEqual(events[0]["event_type"], "remote_job_started")
+
+    def test_launch_remote_job_records_early_exit_after_post_launch_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                experiment = store.add_experiment(
+                    project["id"],
+                    name="self-iterate",
+                    thread_id="thread-1",
+                    remote_ref="ma-user@example.com:30415:/remote/repo",
+                    status="running",
+                )
+                calls = []
+
+                def runner(target, script, ssh_key, timeout):
+                    calls.append(script)
+                    if len(calls) == 1:
+                        return RemoteExecResult(
+                            stdout=(
+                                "REMOTE_COMMIT=abc123\n"
+                                "REMOTE_PID=4242\n"
+                                "REMOTE_LOG=/remote/repo/logs/run.log\n"
+                                "REMOTE_PID_FILE=/remote/repo/logs/run.log.pid\n"
+                            )
+                        )
+                    return RemoteExecResult(
+                        stdout=(
+                            "REMOTE_STATUS=not_running\n"
+                            "REMOTE_LOG_TAIL_START\n"
+                            "bash: -c: line 44: unexpected EOF while looking for matching `)'\n"
+                            "REMOTE_LOG_TAIL_END\n"
+                        )
+                    )
+
+                result = launch_remote_job(
+                    store,
+                    "demo",
+                    "self-iterate",
+                    command="python train.py",
+                    commit="abc123",
+                    require_clean=False,
+                    post_launch_check_delay=0,
+                    remote_runner=runner,
+                )
+
+                self.assertEqual(result["post_launch_check"]["status"], "not_running")
+                events = store.list_experiment_events(experiment["id"], limit=5)
+                self.assertEqual(events[0]["event_type"], "remote_job_exited_early")
+                self.assertEqual(events[0]["level"], "error")
+                updated = store.get_experiment(project["id"], experiment["name"])
+                self.assertEqual(updated["status"], "failed")
 
     def test_launch_remote_job_dry_run_reports_password_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

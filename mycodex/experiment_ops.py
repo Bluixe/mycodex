@@ -66,6 +66,11 @@ _COND_RE = re.compile(
     r"(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$"
 )
 _PASSWORD_PROMPT_RE = re.compile(r"^[^\r\n]*password:\s*[\r\n]*", re.IGNORECASE | re.MULTILINE)
+_REMOTE_FAILURE_HINT_RE = re.compile(
+    r"(Traceback|SyntaxError|unexpected EOF|CUDA out of memory|RuntimeError|"
+    r"command not found|No such file or directory|Killed)",
+    re.IGNORECASE,
+)
 
 LOW_RISK_EXECUTION_CLASSES = {
     "read-only-preflight",
@@ -244,6 +249,8 @@ def launch_remote_job(
     wandb_run_name: str | None = None,
     timeout: int = 120,
     dry_run: bool = False,
+    post_launch_check_delay: float = 2.0,
+    post_launch_check_lines: int = 80,
     remote_runner: RemoteRunner | None = None,
 ) -> dict[str, Any]:
     command = command.strip()
@@ -406,7 +413,93 @@ def launch_remote_job(
         source="mycodex",
         status="running",
     )
-    return {**job_payload, "dry_run": False}
+    post_launch_check: dict[str, Any] | None = None
+    if post_launch_check_delay >= 0:
+        post_launch_check = _post_launch_status_check(
+            target,
+            remote_pid,
+            remote_log,
+            ssh_key=str(resolved_ssh_key) if resolved_ssh_key else None,
+            ssh_password_file=str(resolved_ssh_password_file) if resolved_ssh_password_file else None,
+            timeout=timeout,
+            delay=post_launch_check_delay,
+            lines=post_launch_check_lines,
+            runner=remote_runner,
+        )
+        if post_launch_check.get("check_failed"):
+            store.add_experiment_event(
+                experiment["id"],
+                event_type="remote_post_launch_check_failed",
+                level="warning",
+                message=f"Post-launch remote status check failed: {post_launch_check.get('error')}",
+                payload={**job_payload, "post_launch_check": post_launch_check},
+                source="mycodex",
+                phase="experiment_running",
+                phase_message="Remote job started, but immediate status verification failed.",
+            )
+        elif post_launch_check.get("status") != "running":
+            failure_hint = _remote_output_has_failure_hint(post_launch_check)
+            store.add_experiment_event(
+                experiment["id"],
+                event_type="remote_job_exited_early",
+                level="error" if failure_hint else "warning",
+                message=(
+                    f"Remote job pid={remote_pid} was not running "
+                    f"{post_launch_check_delay:g}s after launch."
+                ),
+                payload={**job_payload, "post_launch_check": post_launch_check},
+                source="mycodex",
+                status="failed" if failure_hint else None,
+                phase="failed" if failure_hint else "waiting_for_decision",
+                phase_message=(
+                    "Remote job exited immediately; inspect log tail for launch errors."
+                    if failure_hint
+                    else "Remote job is no longer running after launch; inspect artifacts before deciding next action."
+                ),
+            )
+    return {**job_payload, "post_launch_check": post_launch_check, "dry_run": False}
+
+
+def _post_launch_status_check(
+    target: RemoteTarget,
+    remote_pid: str,
+    remote_log: str,
+    *,
+    ssh_key: str | None,
+    ssh_password_file: str | None,
+    timeout: int,
+    delay: float,
+    lines: int,
+    runner: RemoteRunner | None,
+) -> dict[str, Any]:
+    if delay > 0:
+        time.sleep(delay)
+    script = _remote_status_script(remote_pid, remote_log, max(1, lines))
+    try:
+        if runner:
+            result = runner(target, script, ssh_key, timeout)
+        else:
+            result = run_remote_script(
+                target,
+                script,
+                ssh_key,
+                timeout,
+                ssh_password_file=ssh_password_file,
+            )
+    except Exception as exc:
+        return {"check_failed": True, "error": str(exc)}
+    parsed = _parse_key_values(result.stdout)
+    return {
+        "status": parsed.get("REMOTE_STATUS") or "unknown",
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "check_failed": False,
+    }
+
+
+def _remote_output_has_failure_hint(check: dict[str, Any]) -> bool:
+    text = f"{check.get('stdout') or ''}\n{check.get('stderr') or ''}"
+    return bool(_REMOTE_FAILURE_HINT_RE.search(text))
 
 
 def remote_job_status(

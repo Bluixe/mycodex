@@ -318,6 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
     exp_launch.add_argument("--wandb-run-id")
     exp_launch.add_argument("--wandb-run-name")
     exp_launch.add_argument("--timeout", type=int, default=120)
+    exp_launch.add_argument("--post-launch-check-delay", type=float, default=2.0)
+    exp_launch.add_argument("--post-launch-check-lines", type=int, default=80)
+    exp_launch.add_argument("--no-post-launch-check", action="store_true")
     exp_launch.add_argument("--dry-run", action="store_true")
     exp_launch.set_defaults(handler=cmd_experiments_launch_remote)
 
@@ -1085,6 +1088,8 @@ def cmd_experiments_launch_remote(store: Store, args) -> None:
         wandb_run_name=args.wandb_run_name,
         timeout=args.timeout,
         dry_run=args.dry_run,
+        post_launch_check_delay=-1 if args.no_post_launch_check else args.post_launch_check_delay,
+        post_launch_check_lines=args.post_launch_check_lines,
     )
     if result.get("dry_run"):
         print("Remote launch dry run.")
