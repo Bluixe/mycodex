@@ -42,7 +42,10 @@ def project_snapshot(
     git = git_snapshot(project["path"])
     health = derive_health(project, sessions, runs, todos, experiments, research_threads, git)
     experiment_events = {
-        str(experiment["id"]): store.list_experiment_events(experiment["id"], limit=3)
+        str(experiment["id"]): store.list_experiment_events(
+            experiment["id"],
+            limit=10 if include_detail else 3,
+        )
         for experiment in experiments
     }
     research_events = {

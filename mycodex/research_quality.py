@@ -19,6 +19,101 @@ class TopicProfile:
 
 
 TOPIC_PROFILES: dict[str, TopicProfile] = {
+    "icrl_agent": TopicProfile(
+        key="icrl_agent",
+        label="LLM agent in-context/meta-RL adaptation",
+        positive=(
+            "in-context rl",
+            "in context rl",
+            "in-context reinforcement learning",
+            "in context reinforcement learning",
+            "meta-rl",
+            "meta reinforcement learning",
+            "language agents",
+            "llm agents",
+            "test-time adaptation",
+            "test time adaptation",
+            "policy adaptation",
+            "trial-and-error",
+            "trial and error",
+            "environment feedback",
+            "cross-episode",
+            "multi-episode",
+            "interaction history",
+            "reflection",
+            "exploration",
+            "exploitation",
+            "sokoban",
+            "alfworld",
+            "webshop",
+            "minesweeper",
+        ),
+        required_any=(
+            "in-context rl",
+            "in-context reinforcement learning",
+            "meta-rl",
+            "language agents",
+            "llm agents",
+            "test-time adaptation",
+            "policy adaptation",
+            "trial-and-error",
+            "cross-episode",
+            "multi-episode",
+        ),
+        negative=(
+            "wireless",
+            "power control",
+            "protein",
+            "liver",
+            "iot",
+            "vulnerability",
+            "tabular",
+            "diffusion policy",
+            "chemical",
+        ),
+        canonical_queries=(
+            "Meta-RL Induces Exploration in Language Agents LaMer",
+            "MAGE Meta-Reinforcement Learning for Language Agents strategic exploration exploitation",
+            "meta-RL language agents test-time adaptation trial-and-error feedback no gradient update",
+            "cross-episode training language agents reflection policy adaptation environment feedback",
+            "in-context policy adaptation language agents reflection reward feedback",
+            "Algorithm Distillation in-context reinforcement learning transformers RL2",
+            "AMAGO scalable in-context reinforcement learning adaptive agents",
+            "OmniRL in-context reinforcement learning randomized worlds meta-training",
+            "EVOLvE evaluating optimizing LLMs in-context exploration",
+            "SKILL0 skill internalization context withdrawal agentic reinforcement learning",
+        ),
+        stable_claims=(
+            {
+                "claim": "For LLM-agent in-context RL, the central distinction is where adaptation happens: test-time context, learned parameters, external memory, or training-time scaffolds.",
+                "status": "supported",
+            },
+            {
+                "claim": "Language-agent meta-RL work should be searched with meta-RL, cross-episode, trial-and-error feedback, policy adaptation, and reflection terms, not only with the literal phrase in-context RL.",
+                "status": "supported",
+            },
+        ),
+        idea_templates=(
+            {
+                "title": "Causal memory-usefulness diagnostics for LLM-agent adaptation",
+                "hypothesis": "If an agent is genuinely adapting from interaction feedback, current outcome-labeled histories should improve grounded action selection over no-history, shuffled-history, and wrong-outcome histories.",
+                "mechanism": "Separate context availability from causal use of feedback by perturbing histories while holding task, prompt budget, and model weights fixed.",
+                "minimal_test": "Run a tiny rollout-only Sokoban or ALFWorld evaluation with no-memory, current-memory, shuffled-memory, and wrong-outcome-memory prompts.",
+                "kill_criteria": "Current histories do not improve effective action ratio, state-change rate, or success over shuffled and no-memory controls.",
+                "novelty_risk": "Medium: LaMer/MAGE and reflection work are close; novelty depends on causal diagnostics and the icrl-llm setting.",
+                "feasibility": "High: can be tested with existing rollout paths before training changes.",
+            },
+            {
+                "title": "Feedback-locus ablation for agentic ICRL",
+                "hypothesis": "Separating reward feedback, natural-language reflection, and raw trajectory context reveals which signal drives adaptation in language-agent meta-RL.",
+                "mechanism": "Ablate the feedback channel while keeping cross-episode context length and environment distribution fixed.",
+                "minimal_test": "Compare reward-only, reflection-only, trajectory-only, combined, and shuffled-feedback contexts on a small held-out task split.",
+                "kill_criteria": "All feedback variants behave similarly, or gains disappear under held-out task seeds.",
+                "novelty_risk": "Medium-high: close to LaMer/MAGE; contribution must be diagnostic clarity or a new failure mode.",
+                "feasibility": "Medium: requires careful prompt/eval plumbing but not necessarily new training.",
+            },
+        ),
+    ),
     "reasoning": TopicProfile(
         key="reasoning",
         label="LLM reasoning",
@@ -227,6 +322,21 @@ def infer_topic_profile(text: str) -> TopicProfile:
     for key, profile in TOPIC_PROFILES.items():
         score = sum(2 for phrase in profile.positive if _has_phrase(haystack, phrase))
         score += sum(3 for phrase in profile.required_any if _has_phrase(haystack, phrase))
+        if key == "icrl_agent" and any(
+            _has_phrase(haystack, phrase)
+            for phrase in (
+                "in-context rl",
+                "in context rl",
+                "in-context reinforcement learning",
+                "meta-rl language agents",
+                "language agents",
+                "test-time adaptation",
+                "trial-and-error",
+                "cross-episode",
+                "multi-episode",
+            )
+        ):
+            score += 12
         if key == "icl" and _has_phrase(haystack, "in-context"):
             score += 8
         if key == "gui" and (_has_phrase(haystack, "gui") or _has_phrase(haystack, "computer use")):
@@ -245,6 +355,37 @@ def expand_queries(question: str, queries: list[str], *, max_queries: int = 4) -
         if clean and clean not in expanded:
             expanded.append(clean)
     return expanded[: max(1, int(max_queries or 4))]
+
+
+def build_concept_preflight(
+    question: str,
+    seed_queries: list[str] | None = None,
+    *,
+    max_queries: int = 12,
+) -> dict[str, Any]:
+    """Build the concept/query gate that must exist before research ranking.
+
+    This deliberately stores a compact research-control artifact rather than a
+    prose survey, so future search and idea-ranking steps know which mechanism
+    families and terminology variants define the target problem.
+    """
+
+    seeds = [str(query).strip() for query in (seed_queries or []) if str(query).strip()]
+    profile = infer_topic_profile(question + "\n" + "\n".join(seeds))
+    return {
+        "profile": profile.key,
+        "label": profile.label,
+        "question": question,
+        "concept_axes": _concept_axes_for_profile(profile),
+        "query_families": _query_families_for_profile(profile),
+        "search_queries": expand_queries(question, seeds, max_queries=max_queries),
+        "anchor_promotion_criteria": _anchor_criteria_for_profile(profile),
+        "ranking_gate": (
+            "Do not rank ideas or claim novelty until core anchors cover the "
+            "concept axes and nearest threats are classified as exact, partial, "
+            "adjacent, or irrelevant."
+        ),
+    }
 
 
 def score_source(
@@ -517,6 +658,140 @@ def coverage_summary(question: str, sources: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _concept_axes_for_profile(profile: TopicProfile) -> list[dict[str, Any]]:
+    if profile.key == "icrl_agent":
+        return [
+            {
+                "axis": "adaptation_locus",
+                "values": [
+                    "test-time in-context policy adaptation",
+                    "parameter-internalized adaptation after meta-training",
+                    "external memory or retrieval assistance",
+                    "training-time scaffold or skill internalization",
+                ],
+                "why": "This prevents SKILL0-style scaffold work from being conflated with AD/ICRL-style test-time adaptation.",
+            },
+            {
+                "axis": "feedback_signal",
+                "values": [
+                    "reward or success/failure",
+                    "natural-language reflection",
+                    "raw trajectory or action history",
+                    "environment state changes",
+                    "opponent or non-stationarity feedback",
+                ],
+                "why": "The same context length can mean different adaptation mechanisms depending on the feedback signal.",
+            },
+            {
+                "axis": "temporal_scope",
+                "values": [
+                    "within-episode",
+                    "cross-episode",
+                    "multi-task meta-train/meta-test",
+                    "multi-agent or opponent adaptation",
+                ],
+                "why": "LaMer-like and MAGE-like papers are often discoverable through episode structure rather than the literal in-context RL term.",
+            },
+            {
+                "axis": "evidence_protocol",
+                "values": [
+                    "no-gradient-update test-time adaptation",
+                    "held-out environment or opponent generalization",
+                    "history/reflection ablations",
+                    "shuffled or wrong-outcome context controls",
+                ],
+                "why": "Idea ranking should prefer sources that causally test whether feedback is used, not just end-to-end score gains.",
+            },
+        ]
+    return [
+        {
+            "axis": "mechanism",
+            "values": list(profile.required_any[:6] or profile.positive[:6]),
+            "why": "Search and ranking should be organized around mechanism terms, not only the user's surface wording.",
+        },
+        {
+            "axis": "evidence_protocol",
+            "values": ["primary source", "benchmark/evaluation", "ablation", "nearest threat"],
+            "why": "Claims and ideas need source-backed evidence before ranking.",
+        },
+    ]
+
+
+def _query_families_for_profile(profile: TopicProfile) -> list[dict[str, Any]]:
+    if profile.key == "icrl_agent":
+        return [
+            {
+                "family": "test_time_policy_adaptation",
+                "purpose": "Find work where a language agent adapts at test time from interaction feedback.",
+                "queries": [
+                    "LaMer Meta-RL Induces Exploration in Language Agents",
+                    "meta-RL language agents test-time adaptation trial-and-error feedback",
+                    "in-context policy adaptation language agents reflection no gradient update",
+                    "cross-episode training language agents environment feedback reflection",
+                ],
+            },
+            {
+                "family": "strategic_exploration_exploitation",
+                "purpose": "Find multi-agent or non-stationary extensions of language-agent meta-RL.",
+                "queries": [
+                    "MAGE Meta-Reinforcement Learning for Language Agents strategic exploration exploitation",
+                    "language agents non-stationary environments feedback meta-RL",
+                    "multi-episode interaction history reflection final episode reward language agents",
+                ],
+            },
+            {
+                "family": "algorithm_distillation_icrl",
+                "purpose": "Connect language-agent work to classic AD/RL2/in-context RL lineages.",
+                "queries": [
+                    "Algorithm Distillation in-context reinforcement learning transformers",
+                    "RL2 in-context reinforcement learning transformer meta-RL",
+                    "AMAGO scalable in-context reinforcement learning adaptive agents",
+                    "OmniRL in-context reinforcement learning randomized worlds meta-training",
+                ],
+            },
+            {
+                "family": "terminology_confounders",
+                "purpose": "Keep adjacent papers that use in-context wording but adapt in a different locus.",
+                "queries": [
+                    "SKILL0 In-Context Agentic Reinforcement Learning skill internalization",
+                    "skill scaffold withdrawal agentic reinforcement learning language agents",
+                    "external memory reflection language agents reinforcement learning",
+                ],
+            },
+        ]
+    return [
+        {
+            "family": "canonical",
+            "purpose": f"Find core {profile.label} primary sources and benchmarks.",
+            "queries": list(profile.canonical_queries[:6]),
+        },
+        {
+            "family": "nearest_threats",
+            "purpose": "Find adjacent or counterevidence sources before ranking ideas.",
+            "queries": [
+                f"{profile.label} benchmark baseline related work",
+                f"{profile.label} ablation limitations failure modes",
+            ],
+        },
+    ]
+
+
+def _anchor_criteria_for_profile(profile: TopicProfile) -> list[str]:
+    if profile.key == "icrl_agent":
+        return [
+            "Promote papers that directly study LLM/language agents adapting from interaction feedback, even if the title says meta-RL rather than in-context RL.",
+            "Promote papers with cross-episode or multi-episode context, reflection/history in the prompt, final-episode or held-out-task objectives, and no-gradient test-time adaptation claims.",
+            "Promote algorithm-distillation/RL2/in-context-RL papers as lineage anchors when they define the adaptation protocol or evaluation assumptions.",
+            "Classify SKILL0-style skill scaffold/internalization work as a terminology/scaffold anchor unless it demonstrates test-time adaptation from feedback.",
+            "Before ranking ideas, label each nearest threat as exact, partial, adjacent, or irrelevant along adaptation locus, feedback signal, temporal scope, and evidence protocol.",
+        ]
+    return [
+        "Promote primary sources that match the mechanism, benchmark, and evidence protocol axes, not just title keywords.",
+        "Promote recent benchmarks or surveys only when they clarify evaluation assumptions or nearest threats.",
+        "Before ranking ideas, classify close sources as exact, partial, adjacent, or irrelevant and record the reason.",
+    ]
+
+
 def _infer_role(text: str, profile: TopicProfile) -> str:
     value = _norm(text)
     if any(term in value for term in ("benchmark", "dataset", "evaluation", "osworld", "webarena", "mind2web")):
@@ -527,7 +802,7 @@ def _infer_role(text: str, profile: TopicProfile) -> str:
         return "counterevidence"
     if any(term in value for term in ("method", "framework", "algorithm", "training", "selection", "verifier", "grounding")):
         return "method"
-    return "method" if profile.key in {"reasoning", "icl", "gui"} else "source"
+    return "method" if profile.key in {"reasoning", "icl", "gui", "icrl_agent"} else "source"
 
 
 def _evidence_quality(metadata: dict[str, Any], source: dict[str, Any], relevance: int) -> int:
@@ -629,6 +904,8 @@ def _idea_refinement(idea: dict[str, Any], profile: TopicProfile, threats: list[
         metric = "success rate, recovery rate after UI perturbation, and extra action/token cost"
     elif profile.key == "icl":
         metric = "accuracy under order/paraphrase perturbations and token-normalized performance"
+    elif profile.key == "icrl_agent":
+        metric = "success rate, effective action ratio, state-change rate, adaptation across episodes, and shuffled-history controls"
     else:
         metric = "accuracy-token Pareto frontier, verifier dependence, and failure-mode coverage"
     return {

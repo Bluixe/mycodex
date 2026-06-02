@@ -5,13 +5,15 @@ import tempfile
 import unittest
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 from mycodex.db import Store
-from mycodex.prompts import daily_summary_prompt, research_control_prompt
+from mycodex.prompts import daily_summary_prompt, experiment_control_prompt, research_control_prompt
 from mycodex.research_connectors import search_zotero
 from mycodex.research_ops import (
     apply_research_contract,
     build_research_control_context,
+    ensure_research_concept_preflight_task,
     extract_research_contract,
     find_research_threads,
     render_research_markdown,
@@ -19,7 +21,7 @@ from mycodex.research_ops import (
     update_research_from_query,
     write_research_markdown,
 )
-from mycodex.service import ExperimentEventStreamer, ResearchEventStreamer
+from mycodex.service import ExperimentEventStreamer, ResearchEventStreamer, _experiment_control_context
 from mycodex.status import project_snapshot, snapshot_to_jsonable
 
 
@@ -139,6 +141,121 @@ class StoreTests(unittest.TestCase):
                 decided = store.get_experiment(project["id"], "self-iterate")
                 self.assertEqual(decided["phase"], "waiting_for_experiment_start")
                 self.assertEqual(decided["latest_decision"], "Continue with a smaller smoke run.")
+
+    def test_experiment_tasks_are_idempotent_and_leaseable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                experiment = store.add_experiment(
+                    project["id"],
+                    name="self-iterate",
+                    thread_id="thread-1",
+                )
+                source_event_id = store.add_experiment_event(
+                    experiment["id"],
+                    event_type="control_contract_parsed",
+                    message="Contract parsed.",
+                )
+                run_id = store.add_run(project["id"], kind="experiment:1:control", prompt="decide")
+
+                task = store.upsert_experiment_task(
+                    experiment["id"],
+                    status="ready",
+                    execution_class="monitor-only",
+                    idempotency_key="contract-1",
+                    contract={"auto_execute": True, "execution_class": "monitor-only"},
+                    source_event_id=source_event_id,
+                    run_id=run_id,
+                )
+                duplicate = store.upsert_experiment_task(
+                    experiment["id"],
+                    status="ready",
+                    execution_class="monitor-only",
+                    idempotency_key="contract-1",
+                    contract={"auto_execute": True, "execution_class": "monitor-only"},
+                    source_event_id=999999,
+                    run_id=999999,
+                )
+
+                self.assertEqual(task["id"], duplicate["id"])
+                self.assertEqual(duplicate["source_event_id"], source_event_id)
+                self.assertEqual(duplicate["run_id"], run_id)
+
+                leased = store.lease_next_experiment_task(
+                    experiment["id"],
+                    owner="worker-1",
+                    lease_seconds=60,
+                )
+                self.assertIsNotNone(leased)
+                self.assertEqual(leased["status"], "leased")
+                self.assertEqual(leased["lease_owner"], "worker-1")
+                self.assertEqual(leased["attempts"], 1)
+
+                updated = store.update_experiment_task_status(
+                    experiment["id"],
+                    leased["id"],
+                    "succeeded",
+                    result={"ok": True},
+                )
+                self.assertEqual(updated["status"], "succeeded")
+                self.assertEqual(updated["lease_owner"], "")
+                self.assertIsNotNone(updated["completed_at"])
+
+    def test_experiment_task_invalid_foreign_keys_are_observation_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                experiment = store.add_experiment(
+                    project["id"],
+                    name="self-iterate",
+                    thread_id="thread-1",
+                )
+
+                task = store.upsert_experiment_task(
+                    experiment["id"],
+                    status="ready",
+                    execution_class="monitor-only",
+                    idempotency_key="contract-invalid-fks",
+                    contract={"auto_execute": True, "execution_class": "monitor-only"},
+                    source_event_id=123456,
+                    run_id=123456,
+                )
+
+                self.assertIsNone(task["source_event_id"])
+                self.assertIsNone(task["run_id"])
+
+    def test_experiment_event_write_rolls_back_on_mid_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                experiment = store.add_experiment(
+                    project["id"],
+                    name="self-iterate",
+                    thread_id="thread-1",
+                )
+
+                with patch("mycodex.db._artifact_ref_for_event", side_effect=RuntimeError("boom")):
+                    with self.assertRaises(RuntimeError):
+                        store.add_experiment_event(
+                            experiment["id"],
+                            event_type="remote_job_started",
+                            payload={"log_path": "/tmp/train.log"},
+                        )
+
+                event_id = store.add_experiment_event(
+                    experiment["id"],
+                    event_type="decision",
+                    message="Recovered after rollback.",
+                )
+                self.assertGreater(event_id, 0)
+                events = store.list_experiment_events(experiment["id"], limit=10)
+                self.assertEqual([event["event_type"] for event in events], ["decision"])
 
     def test_experiment_streamer_records_agent_deltas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,6 +425,84 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(context["ideas"][0]["title"], "Adaptive verifier budget")
                 self.assertEqual(context["tasks"][0]["task_type"], "threat_search")
                 self.assertIn("nearest-threat", context["events"][0]["message"])
+                self.assertIsNone(context["concept_preflight"])
+
+    def test_research_concept_preflight_builds_icrl_query_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                research = store.add_research_thread(
+                    project["id"],
+                    name="icrl-directions",
+                    thread_id="thread-1",
+                    question="LLM+in-context RL 最新研究和能连接到 agent Sokoban 的 idea",
+                )
+                task_id = store.add_research_task(
+                    research["id"],
+                    task_type="concept_preflight",
+                    payload={"auto_queue_search": True},
+                )
+
+                result = run_research_task(store, "demo", "icrl-directions", task_id=task_id)
+
+                self.assertEqual(result["status"], "done")
+                self.assertEqual(result["profile"], "icrl_agent")
+                self.assertTrue(any("LaMer" in query for query in result["queries"]))
+                self.assertTrue(any("MAGE" in query for query in result["queries"]))
+                self.assertGreaterEqual(len(result["queued_tasks"]), 1)
+                context = json.loads(build_research_control_context(store, "demo", "icrl-directions"))
+                self.assertEqual(context["concept_preflight"]["profile"], "icrl_agent")
+                self.assertIn("anchor_promotion_criteria", context["concept_preflight"])
+                markdown = render_research_markdown(store, "demo", "icrl-directions")
+                self.assertIn("## Concept Preflight", markdown)
+                self.assertIn("LaMer", markdown)
+
+    def test_search_task_auto_records_concept_preflight_before_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                research = store.add_research_thread(
+                    project["id"],
+                    name="icrl-search",
+                    thread_id="thread-1",
+                    question="LLM in-context RL for test-time adaptation in language agents",
+                )
+                task_id = store.add_research_task(
+                    research["id"],
+                    task_type="search",
+                    query="in-context RL language agents",
+                    payload={"expand_queries": True},
+                )
+                seen_queries: list[str] = []
+
+                def fake_searcher(query: str, **_kwargs):
+                    seen_queries.append(query)
+                    return [
+                        {
+                            "title": "Meta-RL Induces Exploration in Language Agents",
+                            "url": "https://example.test/lamer",
+                            "abstract": "LaMer trains language agents for test-time adaptation from trial-and-error feedback.",
+                        }
+                    ]
+
+                result = run_research_task(
+                    store,
+                    "demo",
+                    "icrl-search",
+                    task_id=task_id,
+                    searcher=fake_searcher,
+                    limit=1,
+                )
+
+                self.assertEqual(result["status"], "done")
+                self.assertEqual(result["concept_preflight"]["profile"], "icrl_agent")
+                self.assertTrue(any("LaMer" in query for query in seen_queries))
+                claims = store.list_research_claims(research["id"])
+                self.assertIn("concept_preflight", claims[0]["metadata_json"])
 
     def test_research_find_update_and_markdown_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -902,6 +1097,75 @@ class PromptTests(unittest.TestCase):
         prompt = daily_summary_prompt("demo")
         self.assertIn("demo", prompt)
         self.assertIn("每日进度总结", prompt)
+
+    def test_experiment_control_prompt_includes_context_and_strict_json_rule(self) -> None:
+        prompt = experiment_control_prompt(
+            project_name="icrl",
+            experiment_name="procgen-multi-env-icl",
+            experiment_id=5,
+            objective="Improve held-out Procgen performance.",
+            max_iterations=20,
+            remote_ref="root@example.com:/root/icrl",
+            recent_context='{"latest_decision": "baseline eval completed", "ad_bossfight": 0.06}',
+        )
+        self.assertIn("baseline eval completed", prompt)
+        self.assertIn("不要重复已经完成", prompt)
+        self.assertIn("json.loads", prompt)
+        self.assertIn("\\n", prompt)
+        self.assertIn("不能出现 literal newline", prompt)
+        self.assertIn("revision_response", prompt)
+        self.assertIn("required_changes", prompt)
+        self.assertIn("artifacts", prompt)
+        self.assertIn("remote_terminal_complete_ready_for_next", prompt)
+
+    def test_experiment_control_context_keeps_peer_review_over_noisy_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "db.sqlite") as store:
+                project_path = Path(tmp) / "repo"
+                project_path.mkdir()
+                project = store.add_project("demo", project_path)
+                experiment = store.add_experiment(
+                    project["id"],
+                    name="self-iterate",
+                    thread_id="thread-1",
+                    status="running",
+                )
+                store.add_experiment_event(
+                    experiment["id"],
+                    event_type="peer_review_decision",
+                    level="warning",
+                    message="Peer review gate decision: revise.",
+                    payload={
+                        "decision": {
+                            "decision": "revise",
+                            "required_changes": ["address real objection"],
+                        }
+                    },
+                )
+                for idx in range(50):
+                    store.add_experiment_event(
+                        experiment["id"],
+                        event_type="agent_message_delta",
+                        message=f"noisy patch chunk {idx}",
+                    )
+
+                experiment = store.get_experiment(project["id"], "self-iterate")
+                self.assertIsNotNone(experiment)
+                context = json.loads(_experiment_control_context(store, experiment, limit=5))
+
+                self.assertEqual(context["recent_noisy_events_omitted"], 50)
+                self.assertIn(
+                    "address real objection",
+                    json.dumps(context["latest_peer_review_decisions_desc"], ensure_ascii=False),
+                )
+                self.assertEqual(
+                    context["latest_peer_review_decisions_desc"][0]["type"],
+                    "peer_review_decision",
+                )
+                self.assertNotIn(
+                    "noisy patch chunk 49",
+                    json.dumps(context["recent_events_desc"], ensure_ascii=False),
+                )
 
     def test_research_control_prompt_mentions_contract(self) -> None:
         prompt = research_control_prompt(

@@ -48,6 +48,8 @@
 - Monitoring and summaries should be read-only by default.
 - For self-iterating experiments, keep SQLite writes in the outer `mycodex` control plane; the bound Codex session should only produce plans, patches, commands, metrics, and decisions.
 - When a bound experiment session returns `auto_execute: true` with a complete low-risk preflight, diagnostic patch, monitor-only, or small smoke-training contract, the outer control plane may proceed without another user confirmation.
+- For experiment projects, do not stop at proposals after presenting a minimal implementation, small validation, diagnostic run, smoke run, or larger experiment plan. Open or resume a separate Codex review session, give it the project background, current evidence, proposed plan, expected cost, risks, and reason for the plan, exchange enough turns to obtain a concrete critique, then finalize and execute the plan directly when the review supports a complete low-risk or previously authorized contract.
+- Treat the separate review session as an internal decision gate, not as a replacement for safety boundaries. Still ask the user when an action requires unavailable credentials, billing or quota changes, destructive deletion of unrelated data, exposure of local services, or ambiguous writes to user-owned changes.
 - Project defaults are intended to be conservative: `sandbox=read-only`, `approval_policy=never`.
 - For implementation work, use explicit `workspace-write` project/send options.
 - Do not commit local state: `data/`, `logs/`, `*.egg-info`, and `__pycache__/` are ignored.

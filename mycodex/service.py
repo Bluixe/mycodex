@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from datetime import datetime
@@ -8,11 +9,41 @@ from typing import Any, Callable
 
 from .codex_app import CodexAppServerClient
 from .db import Store
-from .prompts import daily_summary_prompt, experiment_control_prompt, research_control_prompt
+from .prompts import (
+    daily_summary_prompt,
+    experiment_contract_repair_prompt,
+    experiment_control_prompt,
+    experiment_peer_review_decision_prompt,
+    experiment_peer_review_prompt,
+    research_control_prompt,
+)
 
 
 VALID_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
+NOISY_EXPERIMENT_EVENT_TYPES = {"agent_message_delta", "codex_event", "codex_tool"}
+CONTROL_CONTEXT_IMPORTANT_EVENT_TYPES = {
+    "blocked",
+    "completed",
+    "control_contract_parse_failed",
+    "control_contract_parsed",
+    "control_turn_failed",
+    "decision",
+    "failed",
+    "peer_review_decision",
+    "peer_review_skipped",
+    "peer_review_soft_objections_recorded",
+    "paused_with_reviewer_objections",
+    "preflight_warning",
+    "remote_anomaly",
+    "remote_anomaly_control_failed",
+    "remote_job_exited_early",
+    "remote_job_started",
+    "remote_sync_failed",
+    "result_analysis",
+    "supervisor_retry_scheduled",
+    "watchdog_skipped",
+}
 
 
 def ensure_valid_sandbox(value: str) -> str:
@@ -189,6 +220,7 @@ def start_experiment_control_turn(
         phase_message="Analyzing previous results and planning the next iteration.",
     )
     stream = ExperimentEventStreamer(store, experiment["id"])
+    recent_context = _experiment_control_context(store, experiment)
     prompt = experiment_control_prompt(
         project_name=project["name"],
         experiment_name=experiment["name"],
@@ -196,6 +228,7 @@ def start_experiment_control_turn(
         objective=experiment["objective"],
         max_iterations=experiment["max_iterations"],
         remote_ref=experiment["remote_ref"],
+        recent_context=recent_context,
     )
     try:
         result = send_prompt(
@@ -232,6 +265,323 @@ def start_experiment_control_turn(
         run_id=result["run_id"],
         phase="waiting_for_decision",
         phase_message="Control analysis completed; waiting for decision or next action.",
+    )
+    return result
+
+
+def start_experiment_contract_repair_turn(
+    store: Store,
+    project_name: str,
+    experiment_name: str,
+    *,
+    previous_output: str,
+    parse_error: str = "",
+    timeout: int = 900,
+    sandbox: str | None = None,
+    approval_policy: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    project = require_project(store, project_name)
+    experiment = store.get_experiment(project["id"], experiment_name)
+    if experiment is None:
+        raise ValueError(f"unknown experiment {experiment_name!r} for project {project_name!r}")
+
+    store.add_experiment_event(
+        experiment["id"],
+        event_type="contract_repair_started",
+        level="warning",
+        message="Started Codex contract repair turn after unparseable control output.",
+        payload={"parse_error": parse_error},
+        source="mycodex",
+        status="running",
+        phase="analyzing",
+        phase_message="Repairing the control-session JSON contract.",
+    )
+    stream = ExperimentEventStreamer(store, experiment["id"])
+    prompt = experiment_contract_repair_prompt(
+        project_name=project["name"],
+        experiment_name=experiment["name"],
+        experiment_id=experiment["id"],
+        parse_error=parse_error,
+        previous_output=_truncate_text(previous_output or "", 60000),
+    )
+    try:
+        result = send_prompt(
+            store,
+            project_name,
+            prompt,
+            kind=f"experiment:{experiment['id']}:contract_repair",
+            thread_id=experiment["thread_id"],
+            timeout=timeout,
+            sync_first=False,
+            sandbox=sandbox,
+            approval_policy=approval_policy,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            update_default_thread=False,
+            event_callback=stream.handle_codex_event,
+        )
+    except Exception as exc:
+        store.add_experiment_event(
+            experiment["id"],
+            event_type="contract_repair_failed",
+            level="error",
+            message=str(exc),
+            source="mycodex",
+            phase="waiting_for_decision",
+            phase_message="Contract repair failed; supervisor will retry later.",
+        )
+        raise
+    store.add_experiment_event(
+        experiment["id"],
+        event_type="contract_repair_completed",
+        level="info" if result["status"] == "completed" else "warning",
+        message=f"Contract repair turn {result['status']}.",
+        payload={"thread_id": result["thread_id"], "turn_id": result["turn_id"]},
+        source="mycodex",
+        run_id=result["run_id"],
+        phase="checking_git",
+        phase_message="Contract repair completed; parsing repaired contract.",
+    )
+    return result
+
+
+def _experiment_control_context(store: Store, experiment, *, limit: int = 30) -> str:
+    raw_events = store.list_experiment_events(experiment["id"], limit=max(1000, limit * 50))
+    noisy_omitted = sum(1 for event in raw_events if event["event_type"] in NOISY_EXPERIMENT_EVENT_TYPES)
+
+    def event_context(event, *, payload_limit: int) -> dict[str, Any]:
+        payload_json = event["payload_json"] or "{}"
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            payload = {"raw": _truncate_text(payload_json, 1200)}
+        return {
+            "id": event["id"],
+            "type": event["event_type"],
+            "level": event["level"],
+            "message": _truncate_text(event["message"] or "", 500),
+            "payload": _truncate_payload(payload, payload_limit),
+            "source": event["source"],
+            "run_status": event["run_status"],
+            "created_at": event["created_at"],
+        }
+
+    important_events = [
+        event_context(event, payload_limit=1800)
+        for event in raw_events
+        if event["event_type"] in CONTROL_CONTEXT_IMPORTANT_EVENT_TYPES
+        or event["level"] in {"warning", "error"}
+    ][:limit]
+    recent_events = [
+        event_context(event, payload_limit=1000)
+        for event in raw_events
+        if event["event_type"] not in NOISY_EXPERIMENT_EVENT_TYPES
+    ][:limit]
+    latest_peer_review_decisions = [
+        event_context(event, payload_limit=2600)
+        for event in raw_events
+        if event["event_type"] == "peer_review_decision"
+    ][:5]
+    snapshot = {
+        "experiment": {
+            "id": experiment["id"],
+            "name": experiment["name"],
+            "status": experiment["status"],
+            "phase": experiment["phase"],
+            "phase_message": experiment["phase_message"],
+            "latest_decision": experiment["latest_decision"],
+            "artifact_ref": experiment["artifact_ref"],
+            "current_iteration": experiment["current_iteration"],
+            "max_iterations": experiment["max_iterations"],
+            "remote_ref": experiment["remote_ref"],
+            "objective": experiment["objective"],
+        },
+        "latest_peer_review_decisions_desc": latest_peer_review_decisions,
+        "important_events_desc": important_events,
+        "recent_events_desc": recent_events,
+        "recent_noisy_events_omitted": noisy_omitted,
+    }
+    return json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 15)] + "...<truncated>"
+
+
+def _truncate_payload(value: Any, limit: int) -> Any:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(text) <= limit:
+        return value
+    return {"truncated_json": _truncate_text(text, limit)}
+
+
+def start_experiment_peer_review_turn(
+    store: Store,
+    project_name: str,
+    experiment_name: str,
+    *,
+    control_output: str,
+    contract: dict[str, Any],
+    timeout: int = 900,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    project = require_project(store, project_name)
+    experiment = store.get_experiment(project["id"], experiment_name)
+    if experiment is None:
+        raise ValueError(f"unknown experiment {experiment_name!r} for project {project_name!r}")
+
+    store.add_experiment_event(
+        experiment["id"],
+        event_type="peer_review_started",
+        level="info",
+        message="Started independent Codex peer-review gate.",
+        source="mycodex",
+        status="running",
+        phase="peer_reviewing",
+        phase_message="An independent Codex session is reviewing the execution contract.",
+        payload={"contract": contract},
+    )
+    prompt = experiment_peer_review_prompt(
+        project_name=project["name"],
+        experiment_name=experiment["name"],
+        experiment_id=experiment["id"],
+        objective=experiment["objective"],
+        control_output=control_output,
+        contract=contract,
+    )
+    review_timeout = max(1, min(timeout, 600))
+    decision_timeout = max(1, min(timeout, 180))
+    rounds: list[dict[str, Any]] = []
+    try:
+        first = send_prompt(
+            store,
+            project_name,
+            prompt,
+            kind=f"experiment:{experiment['id']}:peer_review",
+            new_thread=True,
+            timeout=review_timeout,
+            sync_first=False,
+            sandbox="read-only",
+            approval_policy="never",
+            model=model,
+            reasoning_effort=reasoning_effort,
+            update_default_thread=False,
+        )
+        rounds.append(
+            {
+                "run_id": first["run_id"],
+                "turn_id": first["turn_id"],
+                "status": first["status"],
+                "output_text": first.get("output_text") or "",
+            }
+        )
+    except Exception as exc:
+        result = {
+            "thread_id": "",
+            "rounds": [
+                {
+                    "run_id": None,
+                    "turn_id": None,
+                    "status": "failed",
+                    "output_text": "",
+                    "error": str(exc),
+                }
+            ],
+            "output_text": "",
+        }
+        store.add_experiment_event(
+            experiment["id"],
+            event_type="peer_review_failed",
+            level="error",
+            message=str(exc),
+            payload={"rounds": result["rounds"], "stage": "review"},
+            source="mycodex",
+            phase="waiting_for_decision",
+            phase_message="Peer review failed; control loop will apply bypass policy if eligible.",
+        )
+        return result
+
+    if first.get("status") == "completed":
+        try:
+            final = send_prompt(
+                store,
+                project_name,
+                experiment_peer_review_decision_prompt(),
+                kind=f"experiment:{experiment['id']}:peer_review_decision",
+                thread_id=first["thread_id"],
+                timeout=decision_timeout,
+                sync_first=False,
+                sandbox="read-only",
+                approval_policy="never",
+                model=model,
+                reasoning_effort=reasoning_effort,
+                update_default_thread=False,
+            )
+            rounds.append(
+                {
+                    "run_id": final["run_id"],
+                    "turn_id": final["turn_id"],
+                    "status": final["status"],
+                    "output_text": final.get("output_text") or "",
+                }
+            )
+        except Exception as exc:
+            rounds.append(
+                {
+                    "run_id": None,
+                    "turn_id": None,
+                    "status": "failed",
+                    "output_text": "",
+                    "error": str(exc),
+                }
+            )
+            store.add_experiment_event(
+                experiment["id"],
+                event_type="peer_review_failed",
+                level="warning",
+                message=str(exc),
+                payload={"thread_id": first["thread_id"], "rounds": rounds, "stage": "decision"},
+                source="mycodex",
+                phase="waiting_for_decision",
+                phase_message="Peer-review decision turn failed; control loop will apply bypass policy if eligible.",
+            )
+    else:
+        rounds.append(
+            {
+                "run_id": None,
+                "turn_id": None,
+                "status": "timeout",
+                "output_text": "",
+                "error": "peer review critique turn did not complete before its timeout",
+            }
+        )
+
+    result = {
+        "thread_id": first["thread_id"],
+        "rounds": rounds,
+        "output_text": next((item.get("output_text") or "" for item in reversed(rounds) if item.get("output_text")), ""),
+    }
+    store.add_experiment_event(
+        experiment["id"],
+        event_type="peer_review_completed",
+        level="info",
+        message="Independent Codex peer-review gate completed.",
+        payload={
+            "thread_id": result["thread_id"],
+            "rounds": [
+                {"run_id": item["run_id"], "turn_id": item["turn_id"], "status": item["status"]}
+                for item in result["rounds"]
+            ],
+        },
+        source="mycodex",
+        status="running",
+        phase="checking_git",
+        phase_message="Peer review completed; parsing reviewer decision.",
     )
     return result
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -26,7 +28,7 @@ class CodexAppServerClient:
     """Small JSON-lines client for `codex app-server --listen stdio://`."""
 
     def __init__(self, codex_bin: str = "codex") -> None:
-        self.codex_bin = codex_bin
+        self.codex_bin = _resolve_codex_bin(codex_bin)
         self.proc: subprocess.Popen[str] | None = None
         self._next_id = 1
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -326,3 +328,22 @@ class CodexAppServerClient:
                 if item.get("type") == "agentMessage" and item.get("text"):
                     return item["text"].strip()
         return ""
+
+
+def _resolve_codex_bin(codex_bin: str) -> str:
+    configured = os.environ.get("MYCODEX_CODEX_BIN")
+    if configured:
+        return configured
+    if codex_bin != "codex":
+        return codex_bin
+    found = shutil.which("codex")
+    if found:
+        return found
+    for candidate in (
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex",
+        os.path.expanduser("~/.codex/bin/codex"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return codex_bin

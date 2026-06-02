@@ -10,6 +10,7 @@ from typing import Any
 from .db import Store
 from .research_connectors import ingest_text_source, search_public_sources
 from .research_quality import (
+    build_concept_preflight,
     coverage_summary,
     critique_idea,
     expand_queries,
@@ -21,6 +22,7 @@ from .research_quality import (
 
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+_CONCEPT_PREFLIGHT_KIND = "concept_preflight"
 
 Searcher = Callable[..., list[Any]]
 Ingester = Callable[..., dict[str, Any]]
@@ -41,9 +43,29 @@ def extract_research_contract(text: str) -> dict[str, Any] | None:
             "research_question" in parsed
             or "next_action" in parsed
             or "idea_ledger_delta" in parsed
+            or "concept_preflight" in parsed
         ):
             return parsed
     return None
+
+
+def ensure_research_concept_preflight_task(
+    store: Store,
+    project_name: str,
+    research_name: str,
+    *,
+    auto_queue_search: bool = True,
+) -> int | None:
+    project = _require_project(store, project_name)
+    research = store.get_research_thread(project["id"], research_name)
+    if research is None:
+        raise ValueError(f"unknown research {research_name!r} for project {project_name!r}")
+    return _ensure_concept_preflight_task(
+        store,
+        research["id"],
+        question=str(research["question"] or ""),
+        auto_queue_search=auto_queue_search,
+    )
 
 
 def apply_research_contract(
@@ -63,6 +85,18 @@ def apply_research_contract(
     claim_count = 0
     idea_count = 0
     task_count = 0
+    preflight_count = 0
+
+    contract_preflight = _concept_preflight_from_contract(contract)
+    if contract_preflight:
+        _record_concept_preflight(
+            store,
+            research,
+            contract_preflight,
+            source="control",
+            message="Research concept preflight recorded from control contract.",
+        )
+        preflight_count = 1
 
     for source in _list_of_dicts(contract.get("source_ledger_delta")):
         title = str(source.get("title") or source.get("name") or "").strip()
@@ -151,6 +185,7 @@ def apply_research_contract(
             "claims": claim_count,
             "ideas": idea_count,
             "tasks": task_count,
+            "concept_preflight": preflight_count,
         },
         source="mycodex",
         run_id=run_id,
@@ -173,6 +208,7 @@ def apply_research_contract(
         "claims": claim_count,
         "ideas": idea_count,
         "tasks": task_count,
+        "concept_preflight": preflight_count,
         "auto_continue": bool(contract.get("auto_continue")),
         "phase": phase,
     }
@@ -209,6 +245,7 @@ def build_research_control_context(
             "current_iteration": research["current_iteration"],
             "max_iterations": research["max_iterations"],
         },
+        "concept_preflight": _latest_concept_preflight(store, research["id"]),
         "sources": sources,
         "claims": claims,
         "ideas": ideas,
@@ -272,6 +309,24 @@ def update_research_from_query(
         research = matches[0]["research"]
         research_name = research["name"]
 
+    preflight_task_id = _ensure_concept_preflight_task(
+        store,
+        research["id"],
+        question=str(research["question"] or query),
+        auto_queue_search=False,
+    )
+    if preflight_task_id:
+        store.add_research_event(
+            research["id"],
+            event_type="task_queued",
+            level="info",
+            message=f"Queued concept preflight before incremental update for: {query}",
+            payload={"task_id": preflight_task_id, "query": query},
+            source="mycodex",
+            status="running",
+            phase="concept_preflight",
+        )
+
     task_id = store.add_research_task(
         research["id"],
         task_type="search",
@@ -327,6 +382,7 @@ def update_research_from_query(
         "project": project_name,
         "name": str(research_name),
         "task_id": task_id,
+        "preflight_task_id": preflight_task_id,
         "matches": matches,
         "supervisor": supervisor,
         "markdown_path": str(markdown_path),
@@ -367,6 +423,7 @@ def render_research_markdown(store: Store, project_name: str, research_name: str
     ideas = store.list_research_ideas(research["id"], limit=80)
     tasks = store.list_research_tasks(research["id"], limit=40)
     events = store.list_research_events(research["id"], limit=30)
+    concept_preflight = _latest_concept_preflight(store, research["id"])
 
     lines = [
         f"# Research: {_md_escape(research['name'])}",
@@ -387,11 +444,22 @@ def render_research_markdown(store: Store, project_name: str, research_name: str
         "",
         _md_escape(research["latest_decision"] or research["phase_message"] or "-"),
         "",
+        "## Concept Preflight",
+        "",
+    ]
+    if concept_preflight:
+        lines.extend(_render_concept_preflight_markdown(concept_preflight))
+    else:
+        lines.append("- Missing: run `mycodex research run-task` on a `concept_preflight` task before ranking ideas.")
+    lines.extend(
+        [
+            "",
         "## Sources",
         "",
         "| ID | Status | Role | Depth | Score | Title |",
         "|---|---|---|---|---:|---|",
-    ]
+        ]
+    )
     lines.extend(
         f"| {row['id']} | {_md_escape(row['status'])} | {_md_escape(row['role'])} | "
         f"{_md_escape(row['depth'])} | {row['relevance']}/{row['evidence_quality']} | "
@@ -506,6 +574,15 @@ def run_research_task(
 
     payload = _json_dict(task["payload_json"])
     task_type = str(task["task_type"] or "").strip().lower()
+    inline_preflight: dict[str, Any] | None = None
+    if task_type != _CONCEPT_PREFLIGHT_KIND and _task_requires_concept_preflight(task_type, payload):
+        inline_preflight = _ensure_concept_preflight_recorded(
+            store,
+            research,
+            payload,
+            source="mycodex",
+            message=f"Concept preflight auto-recorded before research task #{task['id']} ({task_type}).",
+        )
     store.update_research_task(task["id"], status="running")
     store.add_research_event(
         research["id"],
@@ -519,7 +596,14 @@ def run_research_task(
     )
 
     try:
-        if task_type == "triage" and _triage_requires_control(task, payload):
+        if task_type == _CONCEPT_PREFLIGHT_KIND:
+            result = _run_concept_preflight_task(
+                store,
+                research,
+                task,
+                payload,
+            )
+        elif task_type == "triage" and _triage_requires_control(task, payload):
             if not allow_control:
                 raise RuntimeError(f"task type {task_type!r} requires a Codex control turn")
             result = _run_control_task(
@@ -633,6 +717,8 @@ def run_research_task(
                 ingester=ingester or ingest_text_source,
                 max_chars=max_chars,
             )
+        if inline_preflight and isinstance(result, dict):
+            result = {**result, "concept_preflight": _compact_preflight_result(inline_preflight)}
         store.update_research_task(task["id"], status="done", result=result)
         store.add_research_event(
             research["id"],
@@ -807,6 +893,284 @@ def _require_project(store: Store, project_name: str):
     if project is None:
         raise ValueError(f"unknown project {project_name!r}; run `mycodex projects add` first")
     return project
+
+
+def _ensure_concept_preflight_task(
+    store: Store,
+    research_id: int,
+    *,
+    question: str,
+    auto_queue_search: bool,
+) -> int | None:
+    if _has_concept_preflight_record(store, research_id):
+        return None
+    for task in store.list_research_tasks(research_id, limit=200):
+        if task["task_type"] == _CONCEPT_PREFLIGHT_KIND and task["status"] in {"queued", "running"}:
+            return None
+    return store.add_research_task(
+        research_id,
+        task_type=_CONCEPT_PREFLIGHT_KIND,
+        title="Define concept map, query expansion, and anchor promotion criteria",
+        payload={
+            "question": question,
+            "auto_queue_search": auto_queue_search,
+            "auto_synthesize": True,
+            "auto_deep_read": True,
+            "auto_refine": True,
+            "reason": "Every research thread must define mechanism axes and query families before search/ranking.",
+        },
+    )
+
+
+def _run_concept_preflight_task(
+    store: Store,
+    research,
+    task,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    preflight = _record_concept_preflight(
+        store,
+        research,
+        _build_preflight_from_payload(research, task, payload),
+        source="mycodex",
+        message="Research concept preflight completed.",
+    )
+    queued_tasks: list[int] = []
+    if bool(payload.get("auto_queue_search")):
+        queued_tasks.append(
+            store.add_research_task(
+                research["id"],
+                task_type="search",
+                title="Search with concept-preflight query expansion",
+                query="\n".join(preflight.get("search_queries") or []),
+                payload={
+                    "expand_queries": False,
+                    "auto_synthesize": bool(payload.get("auto_synthesize", True)),
+                    "auto_deep_read": bool(payload.get("auto_deep_read", True)),
+                    "auto_refine": bool(payload.get("auto_refine", True)),
+                    "concept_preflight_claim_id": preflight.get("claim_id"),
+                },
+            )
+        )
+    return {
+        "profile": preflight.get("profile"),
+        "label": preflight.get("label"),
+        "queries": preflight.get("search_queries") or [],
+        "query_families": [item.get("family") for item in preflight.get("query_families") or []],
+        "anchor_promotion_criteria": len(preflight.get("anchor_promotion_criteria") or []),
+        "claim_id": preflight.get("claim_id"),
+        "queued_tasks": queued_tasks,
+    }
+
+
+def _ensure_concept_preflight_recorded(
+    store: Store,
+    research,
+    payload: dict[str, Any],
+    *,
+    source: str,
+    message: str,
+) -> dict[str, Any] | None:
+    existing = _latest_concept_preflight(store, research["id"])
+    if existing:
+        return None
+    return _record_concept_preflight(
+        store,
+        research,
+        build_concept_preflight(
+            str(research["question"] or payload.get("question") or ""),
+            _payload_seed_queries(payload),
+            max_queries=int(payload.get("max_queries") or 12),
+        ),
+        source=source,
+        message=message,
+    )
+
+
+def _record_concept_preflight(
+    store: Store,
+    research,
+    preflight: dict[str, Any],
+    *,
+    source: str,
+    message: str,
+) -> dict[str, Any]:
+    preflight = _normalize_concept_preflight(preflight, str(research["question"] or ""))
+    existing = _latest_concept_preflight(store, research["id"])
+    if existing:
+        return existing
+    claim_id = store.add_research_claim(
+        research["id"],
+        claim=(
+            "Concept preflight: define the research problem by mechanism axes, "
+            "query families, and anchor promotion criteria before ranking ideas."
+        ),
+        status="supported",
+        support="research control preflight",
+        confidence=5,
+        notes=_concept_preflight_notes(preflight),
+        metadata={
+            "kind": _CONCEPT_PREFLIGHT_KIND,
+            "concept_preflight": preflight,
+        },
+    )
+    recorded = {**preflight, "claim_id": claim_id}
+    store.add_research_event(
+        research["id"],
+        event_type=_CONCEPT_PREFLIGHT_KIND,
+        level="info",
+        message=message,
+        payload={"claim_id": claim_id, "concept_preflight": preflight},
+        source=source,
+        status="running",
+        phase="concept_preflight",
+        phase_message=message,
+    )
+    return recorded
+
+
+def _build_preflight_from_payload(research, task, payload: dict[str, Any]) -> dict[str, Any]:
+    supplied = payload.get("concept_preflight")
+    if isinstance(supplied, dict):
+        return supplied
+    return build_concept_preflight(
+        str(payload.get("question") or research["question"] or ""),
+        _task_queries(task, payload),
+        max_queries=int(payload.get("max_queries") or 12),
+    )
+
+
+def _concept_preflight_from_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
+    direct = contract.get("concept_preflight")
+    if isinstance(direct, dict):
+        return direct
+    concept_map = contract.get("concept_map")
+    query_expansion = contract.get("query_expansion")
+    anchor_criteria = contract.get("anchor_promotion_criteria")
+    if not any(isinstance(item, (dict, list)) for item in (concept_map, query_expansion, anchor_criteria)):
+        return None
+    return {
+        "concept_axes": concept_map if isinstance(concept_map, list) else [],
+        "query_families": query_expansion if isinstance(query_expansion, list) else [],
+        "anchor_promotion_criteria": anchor_criteria if isinstance(anchor_criteria, list) else [],
+        "question": str(contract.get("research_question") or ""),
+    }
+
+
+def _normalize_concept_preflight(preflight: dict[str, Any], question: str) -> dict[str, Any]:
+    if preflight.get("profile") and preflight.get("search_queries"):
+        return preflight
+    generated = build_concept_preflight(str(preflight.get("question") or question or ""))
+    return {
+        **generated,
+        **preflight,
+        "concept_axes": preflight.get("concept_axes") or generated["concept_axes"],
+        "query_families": preflight.get("query_families") or generated["query_families"],
+        "search_queries": preflight.get("search_queries") or generated["search_queries"],
+        "anchor_promotion_criteria": preflight.get("anchor_promotion_criteria")
+        or generated["anchor_promotion_criteria"],
+        "ranking_gate": preflight.get("ranking_gate") or generated["ranking_gate"],
+    }
+
+
+def _latest_concept_preflight(store: Store, research_id: int) -> dict[str, Any] | None:
+    for claim in store.list_research_claims(research_id, limit=120):
+        metadata = _json_dict(claim["metadata_json"])
+        if metadata.get("kind") == _CONCEPT_PREFLIGHT_KIND:
+            preflight = metadata.get("concept_preflight")
+            if isinstance(preflight, dict):
+                return {**preflight, "claim_id": claim["id"]}
+    return None
+
+
+def _has_concept_preflight_record(store: Store, research_id: int) -> bool:
+    return _latest_concept_preflight(store, research_id) is not None
+
+
+def _task_requires_concept_preflight(task_type: str, payload: dict[str, Any]) -> bool:
+    if payload.get("require_concept_preflight") is False:
+        return False
+    return task_type in {
+        "search",
+        "source_search",
+        "literature_search",
+        "triage",
+        "deep_read_top",
+        "read_top",
+        "paper_read_top",
+        "threat_search",
+        "nearest_threat_search",
+        "idea_critique",
+        "critique_ideas",
+        "synthesize",
+        "local_synthesize",
+        "rank_ideas",
+        "local_idea_tournament",
+        "idea_tournament",
+        "design_experiment",
+    }
+
+
+def _payload_seed_queries(payload: dict[str, Any]) -> list[str]:
+    queries: list[str] = []
+    raw_queries = payload.get("queries")
+    if isinstance(raw_queries, list):
+        queries.extend(str(item).strip() for item in raw_queries if str(item).strip())
+    elif isinstance(raw_queries, str) and raw_queries.strip():
+        queries.append(raw_queries.strip())
+    raw_query = payload.get("query")
+    if isinstance(raw_query, str) and raw_query.strip():
+        queries.append(raw_query.strip())
+    return queries
+
+
+def _concept_preflight_notes(preflight: dict[str, Any]) -> str:
+    families = [
+        str(item.get("family") or item.get("name") or "")
+        for item in preflight.get("query_families", [])
+        if isinstance(item, dict)
+    ]
+    criteria = [str(item) for item in preflight.get("anchor_promotion_criteria", [])]
+    return "\n".join(
+        [
+            f"Profile: {preflight.get('profile') or '-'} ({preflight.get('label') or '-'})",
+            "Query families: " + (", ".join(item for item in families if item) or "-"),
+            "Anchor criteria:",
+            *[f"- {item}" for item in criteria[:8]],
+        ]
+    )
+
+
+def _compact_preflight_result(preflight: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "profile": preflight.get("profile"),
+        "claim_id": preflight.get("claim_id"),
+        "queries": len(preflight.get("search_queries") or []),
+        "query_families": len(preflight.get("query_families") or []),
+    }
+
+
+def _render_concept_preflight_markdown(preflight: dict[str, Any]) -> list[str]:
+    lines = [
+        f"- Profile: `{_md_escape(preflight.get('profile') or '-')}` ({_md_escape(preflight.get('label') or '-')})",
+        f"- Ranking gate: {_md_escape(preflight.get('ranking_gate') or '-')}",
+        "- Query families: "
+        + _md_escape(
+            ", ".join(
+                str(item.get("family") or item.get("name") or "")
+                for item in preflight.get("query_families", [])
+                if isinstance(item, dict)
+            )
+            or "-"
+        ),
+        "- Anchor criteria:",
+    ]
+    for criterion in (preflight.get("anchor_promotion_criteria") or [])[:6]:
+        lines.append(f"  - {_md_escape(criterion)}")
+    lines.append("- Search queries:")
+    for query in (preflight.get("search_queries") or [])[:8]:
+        lines.append(f"  - `{_md_escape(query)}`")
+    return lines
 
 
 def _run_search_like_task(
@@ -1615,6 +1979,11 @@ def _deep_read_notes(result: dict[str, Any], text: str) -> str:
 
 
 def _task_result_message(task_type: str, result: dict[str, Any]) -> str:
+    if task_type == _CONCEPT_PREFLIGHT_KIND:
+        return (
+            "Research concept preflight completed; "
+            f"{len(result.get('queries') or [])} search query candidate(s) prepared."
+        )
     if "sources" in result:
         return f"Research task {task_type} completed; {result['sources']} source(s) recorded."
     if "chars" in result:
@@ -1627,6 +1996,7 @@ def _task_result_message(task_type: str, result: dict[str, Any]) -> str:
 
 def _phase_for_task(task_type: str) -> str:
     return {
+        "concept_preflight": "concept_preflight",
         "search": "searching",
         "source_search": "searching",
         "literature_search": "searching",
@@ -1653,6 +2023,7 @@ def _phase_for_task(task_type: str) -> str:
 
 def _phase_after_task(task_type: str) -> str:
     return {
+        "concept_preflight": "searching",
         "search": "triage",
         "source_search": "triage",
         "literature_search": "triage",

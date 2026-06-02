@@ -108,9 +108,16 @@
                 {% endif %}
                 {% set events = snapshot.experiment_events.get(experiment.id|string, []) %}
                 {% if events %}
-                <p class="muted">
-                  Latest: {{ events[0].event_type }} · {{ events[0].message or events[0].created_at|ts }}
-                </p>
+                <div class="event-strip">
+                  {% for event in events %}
+                  <div class="event-item {{ event.level }}">
+                    <span>#{{ event.id }}</span>
+                    <strong>{{ event.event_type }}</strong>
+                    <small>{{ event.created_at|ts }}</small>
+                    <p>{{ event.message or "-" }}</p>
+                  </div>
+                  {% endfor %}
+                </div>
                 {% endif %}
               </td>
               <td>

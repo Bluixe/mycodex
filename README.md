@@ -88,6 +88,19 @@ For a single scheduler pass, useful from launchd/cron:
 mycodex daemon --once
 ```
 
+Install the daemon as a per-user macOS LaunchAgent so it starts again after a
+Mac reboot or user login:
+
+```bash
+mycodex daemon --install-launch-agent --interval 300 --timeout 1800
+mycodex daemon --launch-agent-status
+mycodex daemon --uninstall-launch-agent
+```
+
+The LaunchAgent uses `RunAtLoad` and `KeepAlive`, writes logs under
+`~/Library/Logs/mycodex`, and invokes the same `mycodex daemon` command with
+the selected SQLite DB path.
+
 The daemon logs due/completed/failed scheduled work to stdout/stderr. If a
 project has Telegram bindings and `MYCODEX_TELEGRAM_BOT_TOKEN` is set in the
 daemon environment, or a local token file exists at
@@ -253,7 +266,14 @@ Inspect state:
 ```bash
 mycodex experiments list --project icrl-llm
 mycodex experiments status --project icrl-llm --name self-iterate
+mycodex experiments watch --project icrl-llm --name self-iterate --interval 10 --limit 25
 ```
+
+`watch` refreshes the experiment phase and recent high-level event stream,
+including control-turn, peer-review, remote-job, and W&B polling events. Add
+`--include-deltas` when you also want streamed agent-message chunks. The local
+web dashboard shows the recent event stream on the project page, and the same
+data is available from `/api/projects/{project}/experiments/{name}`.
 
 Start a Codex control turn on the experiment thread:
 
@@ -276,6 +296,31 @@ command, budget, W&B identity, metrics, and hard stop conditions. Low-risk
 read-only preflight, diagnostic patches, monitor-only steps, and tightly
 budgeted smoke training can proceed without another user confirmation when that
 contract is complete.
+
+Control-turn contracts are also persisted as durable protocol tasks. This makes
+the loop explicit: the bound Codex session proposes a contract, `mycodex`
+records it as `proposed`, `ready`, or `blocked`, and a protocol worker leases
+and executes only `ready` tasks. Inspect and operate that queue with:
+
+```bash
+mycodex experiments task-list --project icrl-llm --name self-iterate
+mycodex experiments task-approve --project icrl-llm --name self-iterate --task-id 12
+mycodex experiments task-run --project icrl-llm --name self-iterate --max-tasks 1
+mycodex experiments task-recover --project icrl-llm --name self-iterate
+```
+
+`task-approve` moves a `proposed` or `blocked` task to `ready`.
+`task-run` leases ready tasks, executes the stored contract, and writes
+`experiment_task_lease_acquired`, `experiment_task_succeeded`,
+`experiment_task_failed`, or `experiment_task_blocked` events. The watchdog also
+checks for ready protocol tasks before falling back to stale-supervisor logic,
+so a complete eval/preflight contract does not depend on a remote PID or W&B
+target merely to be woken up.
+`task-recover` is the local-restart repair path: expired `leased` tasks return
+to `ready`; stale `running` tasks return to `ready` only if no remote launch
+event mentions the protocol task id. If a stale `running` task already touched
+the remote side, it is marked `blocked` so the control session can inspect
+before any retry.
 
 Commit and push local experiment changes:
 
@@ -308,6 +353,93 @@ secret value.
 `launch-remote` writes `remote_pull_started`, `remote_pull_completed`, and
 `remote_job_started` events. The job-started payload includes the remote PID,
 log path, commit, command, and optional W&B run fields.
+
+Sync structured remote controller state into local events:
+
+```bash
+mycodex experiments sync-remote \
+  --project icrl-llm \
+  --name self-iterate \
+  --remote-ref root@example.com:/remote/repo \
+  --remote-state-root /root/autodl-tmp/icrl_runs/procgen-multi-env-icl/controller
+```
+
+`sync-remote` imports remote `state.json`, `events.jsonl`, pidfiles, summary
+rows, contract/env hashes, command hashes, GPU state, and short log tails. It
+writes `remote_heartbeat`, deduped `remote_event`, and `remote_anomaly` events.
+SSH/Python sync failures are recorded as `remote_sync_failed` and do not count
+as remote experiment failures.
+
+Run a background watchdog that first syncs remote state and then continues the
+control loop when the remote snapshot itself shows a real anomaly:
+
+```bash
+mycodex experiments watchdog \
+  --project icrl-llm \
+  --name self-iterate \
+  --remote-state-root /root/autodl-tmp/icrl_runs/procgen-multi-env-icl/controller \
+  --interval 300 \
+  --max-cycles 288
+```
+
+For each successful sync, the watchdog uses persistent anomaly fingerprints to
+avoid opening duplicate control turns. When a new control anomaly appears, it
+starts the bound control session, runs the peer-review gate, and only executes a
+complete approved contract. The watchdog does not directly kill or restart
+remote jobs based only on a local stale timer.
+
+To let `mycodex daemon` own this lifecycle, put the watchdog options in the
+experiment config and keep the normal daemon running:
+
+```json
+{
+  "watchdog": {
+    "enabled": true,
+    "interval_seconds": 300,
+    "remote_base": "/root/autodl-tmp/icrl_runs/procgen-multi-env-icl",
+    "remote_python": "/root/miniconda3/envs/dpt/bin/python3",
+    "remote_sync": true,
+    "remote_anomaly_control": true,
+    "stale_seconds": 900,
+    "monitor_only": false,
+    "trigger_next_control": true,
+    "auto_execute": true,
+    "allow_full_train": true,
+    "peer_review_bypass_timeout_seconds": 1800,
+    "peer_review_bypass_on": "revise,timeout"
+  },
+  "remote_state": {
+    "base": "/root/autodl-tmp/icrl_runs/procgen-multi-env-icl",
+    "eval_epochs": ["1", "2", "final"],
+    "eval_envs": ["bossfight", "caveflyer"]
+  }
+}
+```
+
+Daemon-owned cycles write `experiment_watchdog_daemon_started`,
+`experiment_watchdog_daemon_completed`, or `experiment_watchdog_daemon_failed`
+events around the same watchdog state machine. `remote_heartbeat` remains
+remote-observation evidence; it is not counted as local supervisor freshness.
+If a LaunchAgent or another wrapper has just written `watchdog_heartbeat`, the
+daemon respects that freshness window and does not open a duplicate watchdog
+cycle. If an `experiment:<id>:` Codex run is still active, the daemon skips
+with `experiment_watchdog_daemon_skipped_active_control`; `experiments
+watchdog` itself also skips with `experiment_watchdog_skipped_active_control`.
+If that run exceeds `control_timeout + 60s`, it is marked failed with
+`experiment_control_run_marked_stale` and the watchdog retries. The daemon runs
+experiment watchdog checks before daily-summary and scheduled-rule work. Prefer
+`remote_base`/`remote_state.base` for experiment families with one controller
+directory per run; if an explicit controller root is stale or empty, remote
+sync falls back to the newest valid `state.json`/`events.jsonl` under the base
+directory. Remote heartbeats include host boot id and uptime when available; a
+boot-id change, or a very recent remote boot with no live controller processes
+and incomplete work, is treated as a control anomaly. Set
+`watchdog.monitor_only=true` when the daemon should only recover stale local
+leases and record remote heartbeat/anomaly evidence; in that mode it does not
+execute ready protocol tasks, run supervisor cycles, or start control turns.
+Terminal-complete anomaly fingerprints ignore drifting log-tail hashes, so a
+completed run does not repeatedly spawn control turns just because logs were
+appended after completion.
 
 Poll W&B once or repeatedly and write metric/decision events:
 
@@ -397,6 +529,9 @@ mycodex research supervise \
 
 Task types supported by the local worker:
 
+- `concept_preflight`: create the mechanism taxonomy, synonym/query families,
+  anchor promotion criteria, and exact/partial/adjacent/irrelevant threat rules
+  that must exist before normal search, synthesis, or idea ranking
 - `search`, `source_search`, `literature_search`, `triage`: search Zotero and
   public sources, then write candidates to `research_sources`
 - `deep_read`, `read`, `paper_read`, `ingest`: ingest a URL or local file into
@@ -419,6 +554,24 @@ has a local PDF attachment under Zotero storage, a later `deep_read` task can
 ingest that attachment. Override the data directory with `ZOTERO_DATA_DIR`.
 
 A typical local auto-research pass is:
+
+```bash
+mycodex research task-add \
+  --project icrl-llm \
+  --name reasoning-directions \
+  --task-type concept_preflight \
+  --payload-json '{"auto_queue_search": true}'
+
+mycodex research supervise \
+  --project icrl-llm \
+  --name reasoning-directions \
+  --max-cycles 5 \
+  --no-trigger-control
+```
+
+`research create` queues a `concept_preflight` task by default. For one-off
+manual updates, you can still queue a search directly; the worker will record a
+concept preflight first if one is missing. For example:
 
 ```bash
 mycodex research task-add \

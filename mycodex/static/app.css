@@ -648,6 +648,49 @@ td p {
   margin: 4px 0 0;
 }
 
+.event-strip {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  max-width: 760px;
+}
+
+.event-item {
+  background: #f8fafc;
+  border-left: 3px solid #c8d0dc;
+  border-radius: 5px;
+  display: grid;
+  gap: 3px 8px;
+  grid-template-columns: auto auto 1fr;
+  padding: 7px 9px;
+}
+
+.event-item.warning {
+  border-left-color: var(--warning);
+}
+
+.event-item.error {
+  border-left-color: var(--danger);
+}
+
+.event-item strong,
+.event-item span,
+.event-item small {
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.event-item span,
+.event-item small {
+  color: var(--muted);
+}
+
+.event-item p {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .muted-row {
   opacity: 0.65;
 }

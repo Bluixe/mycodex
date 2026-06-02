@@ -3,19 +3,33 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
-from .daemon import run_daemon
+from .daemon import run_daemon, run_single_rule_watch
 from .db import Store
 from .codex_state import discover_codex_projects
 from .experiment_ops import (
+    extract_execution_contract,
     git_commit_push,
     launch_remote_job,
     poll_wandb_run,
+    recover_stale_experiment_tasks,
+    record_execution_contract_task,
     remote_job_status,
+    run_ready_experiment_tasks,
+    run_experiment_watchdog,
     supervise_experiment,
+    sync_remote_experiment_state,
+)
+from .launch_agent import (
+    daemon_launch_agent_status,
+    default_daemon_launch_agent_label,
+    install_daemon_launch_agent,
+    uninstall_daemon_launch_agent,
 )
 from .research_ops import (
+    ensure_research_concept_preflight_task,
     find_research_threads,
     run_research_task,
     supervise_research,
@@ -144,10 +158,17 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--interval", type=int, default=300)
     daemon.add_argument("--once", action="store_true")
     daemon.add_argument("--timeout", type=int, default=1800)
+    daemon.add_argument("--allow-full-train", action="store_true")
     daemon.add_argument("--no-telegram-notify", action="store_true")
     daemon.add_argument("--telegram-token-file")
     daemon.add_argument("--telegram-token-env", default="MYCODEX_TELEGRAM_BOT_TOKEN")
     daemon.add_argument("--telegram-proxy-url")
+    daemon.add_argument("--install-launch-agent", action="store_true", help="Install and bootstrap a macOS LaunchAgent for this daemon")
+    daemon.add_argument("--uninstall-launch-agent", action="store_true", help="Unload and remove the macOS LaunchAgent for this daemon")
+    daemon.add_argument("--launch-agent-status", action="store_true", help="Show macOS LaunchAgent install/load status")
+    daemon.add_argument("--launch-agent-label", help="Override the LaunchAgent label")
+    daemon.add_argument("--launch-agent-log-dir", help="Directory for LaunchAgent stdout/stderr logs")
+    daemon.add_argument("--no-bootstrap", action="store_true", help="Write the LaunchAgent plist without loading it")
     daemon.set_defaults(handler=cmd_daemon)
 
     web = sub.add_parser("web", help="Run the local web dashboard")
@@ -205,11 +226,23 @@ def build_parser() -> argparse.ArgumentParser:
     r_add.add_argument("--project", required=True)
     r_add.add_argument("--name", required=True)
     r_add.add_argument("--kind", default="custom")
+    r_add.add_argument("--thread-id")
     r_add.add_argument("--time-of-day")
     r_add.add_argument("--interval-seconds", type=int)
     r_add.add_argument("--prompt", required=True)
     r_add.add_argument("--disabled", action="store_true")
     r_add.set_defaults(handler=cmd_rules_add)
+    r_watch = rules_sub.add_parser("watch", help="Run a scheduler loop for one rule")
+    r_watch.add_argument("--project", required=True)
+    r_watch.add_argument("--name", required=True)
+    r_watch.add_argument("--interval", type=int, default=60)
+    r_watch.add_argument("--once", action="store_true")
+    r_watch.add_argument("--timeout", type=int, default=1800)
+    r_watch.add_argument("--no-telegram-notify", action="store_true")
+    r_watch.add_argument("--telegram-token-file")
+    r_watch.add_argument("--telegram-token-env", default="MYCODEX_TELEGRAM_BOT_TOKEN")
+    r_watch.add_argument("--telegram-proxy-url")
+    r_watch.set_defaults(handler=cmd_rules_watch)
 
     runs = sub.add_parser("runs", help="Inspect run history")
     runs_sub = runs.add_subparsers(dest="runs_command", required=True)
@@ -246,6 +279,15 @@ def build_parser() -> argparse.ArgumentParser:
     exp_status.add_argument("--name", required=True)
     exp_status.add_argument("--limit", type=int, default=20)
     exp_status.set_defaults(handler=cmd_experiments_status)
+
+    exp_watch = experiments_sub.add_parser("watch", help="Continuously show experiment phase and event stream")
+    exp_watch.add_argument("--project", required=True)
+    exp_watch.add_argument("--name", required=True)
+    exp_watch.add_argument("--limit", type=int, default=25)
+    exp_watch.add_argument("--interval", type=float, default=10.0)
+    exp_watch.add_argument("--once", action="store_true")
+    exp_watch.add_argument("--include-deltas", action="store_true", help="Include streamed agent message chunks")
+    exp_watch.set_defaults(handler=cmd_experiments_watch)
 
     exp_event = experiments_sub.add_parser("event", help="Record an experiment event")
     exp_event.add_argument("--project", required=True)
@@ -287,6 +329,38 @@ def build_parser() -> argparse.ArgumentParser:
     exp_start.add_argument("--model")
     exp_start.add_argument("--effort", dest="reasoning_effort")
     exp_start.set_defaults(handler=cmd_experiments_start)
+
+    exp_task_list = experiments_sub.add_parser("task-list", help="List durable experiment protocol tasks")
+    exp_task_list.add_argument("--project", required=True)
+    exp_task_list.add_argument("--name", required=True)
+    exp_task_list.add_argument("--status", action="append", default=[])
+    exp_task_list.add_argument("--limit", type=int, default=20)
+    exp_task_list.set_defaults(handler=cmd_experiments_task_list)
+
+    exp_task_approve = experiments_sub.add_parser("task-approve", help="Mark a proposed experiment task ready")
+    exp_task_approve.add_argument("--project", required=True)
+    exp_task_approve.add_argument("--name", required=True)
+    exp_task_approve.add_argument("--task-id", type=int, required=True)
+    exp_task_approve.set_defaults(handler=cmd_experiments_task_approve)
+
+    exp_task_run = experiments_sub.add_parser("task-run", help="Run ready durable experiment protocol tasks")
+    exp_task_run.add_argument("--project", required=True)
+    exp_task_run.add_argument("--name", required=True)
+    exp_task_run.add_argument("--owner", default="mycodex-cli")
+    exp_task_run.add_argument("--lease-seconds", type=int, default=900)
+    exp_task_run.add_argument("--max-tasks", type=int, default=1)
+    exp_task_run.add_argument("--remote-ref")
+    exp_task_run.add_argument("--ssh-key")
+    exp_task_run.add_argument("--ssh-password-file")
+    exp_task_run.add_argument("--remote-python")
+    exp_task_run.add_argument("--allow-full-train", action="store_true")
+    exp_task_run.set_defaults(handler=cmd_experiments_task_run)
+
+    exp_task_recover = experiments_sub.add_parser("task-recover", help="Recover stale leased/running experiment protocol tasks")
+    exp_task_recover.add_argument("--project")
+    exp_task_recover.add_argument("--name")
+    exp_task_recover.add_argument("--running-timeout-seconds", type=int, default=3600)
+    exp_task_recover.set_defaults(handler=cmd_experiments_task_recover)
 
     exp_git_push = experiments_sub.add_parser("git-push", help="Commit selected local changes and push")
     exp_git_push.add_argument("--project", required=True)
@@ -336,6 +410,23 @@ def build_parser() -> argparse.ArgumentParser:
     exp_remote_status.add_argument("--timeout", type=int, default=30)
     exp_remote_status.set_defaults(handler=cmd_experiments_remote_status)
 
+    exp_sync_remote = experiments_sub.add_parser("sync-remote", help="Sync structured remote experiment state into local events")
+    exp_sync_remote.add_argument("--project", required=True)
+    exp_sync_remote.add_argument("--name", required=True)
+    exp_sync_remote.add_argument("--remote-ref")
+    exp_sync_remote.add_argument("--ssh-key")
+    exp_sync_remote.add_argument("--ssh-password-file")
+    exp_sync_remote.add_argument("--remote-state-root")
+    exp_sync_remote.add_argument("--remote-state-path")
+    exp_sync_remote.add_argument("--remote-events-path")
+    exp_sync_remote.add_argument("--remote-base")
+    exp_sync_remote.add_argument("--remote-python")
+    exp_sync_remote.add_argument("--event-tail", type=int, default=200)
+    exp_sync_remote.add_argument("--log-tail-lines", type=int, default=120)
+    exp_sync_remote.add_argument("--stale-seconds", type=int, default=900)
+    exp_sync_remote.add_argument("--timeout", type=int, default=90)
+    exp_sync_remote.set_defaults(handler=cmd_experiments_sync_remote)
+
     exp_poll = experiments_sub.add_parser("poll-wandb", help="Poll W&B and record metric/decision events")
     exp_poll.add_argument("--project", required=True)
     exp_poll.add_argument("--name", required=True)
@@ -367,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp_supervise.add_argument("--remote-ref")
     exp_supervise.add_argument("--ssh-key")
     exp_supervise.add_argument("--ssh-password-file")
+    exp_supervise.add_argument("--remote-python")
     exp_supervise.add_argument("--pid", help="Remote process PID to monitor when the job was attached manually")
     exp_supervise.add_argument("--log-path", help="Remote log path to tail when the job was attached manually")
     exp_supervise.add_argument("--interval", type=int, default=300)
@@ -375,11 +467,70 @@ def build_parser() -> argparse.ArgumentParser:
     exp_supervise.add_argument("--no-auto-execute", action="store_true")
     exp_supervise.add_argument("--allow-full-train", action="store_true")
     exp_supervise.add_argument("--control-timeout", type=int, default=1800)
+    exp_supervise.add_argument("--peer-review-bypass-timeout-seconds", type=int, default=1800)
+    exp_supervise.add_argument(
+        "--peer-review-bypass-on",
+        default="revise,timeout",
+        help="Comma-separated peer-review outcomes eligible for timed bypass; use 'none' to disable",
+    )
+    exp_supervise.add_argument(
+        "--peer-review-bypass-classes",
+        default="read-only-preflight,diagnostic-patch,smoke-train,monitor-only,full-train",
+        help="Comma-separated execution classes eligible for timed peer-review bypass",
+    )
     exp_supervise.add_argument("--sandbox", choices=sorted(["read-only", "workspace-write", "danger-full-access"]))
     exp_supervise.add_argument("--approval-policy", choices=sorted(["untrusted", "on-failure", "on-request", "never"]))
     exp_supervise.add_argument("--model")
     exp_supervise.add_argument("--reasoning-effort")
     exp_supervise.set_defaults(handler=cmd_experiments_supervise)
+
+    exp_watchdog = experiments_sub.add_parser("watchdog", help="Restart one-cycle supervision when experiment activity is stale")
+    exp_watchdog.add_argument("--project", required=True)
+    exp_watchdog.add_argument("--name", help="Experiment name. Defaults to all running experiments in the project.")
+    exp_watchdog.add_argument("--run-path", help="W&B run path: entity/project/run_id")
+    exp_watchdog.add_argument("--metric", action="append", default=[])
+    exp_watchdog.add_argument("--stop-condition", action="append", default=[])
+    exp_watchdog.add_argument("--no-fail-on-nonfinite", action="store_true")
+    exp_watchdog.add_argument("--complete-on-finish", action="store_true")
+    exp_watchdog.add_argument("--remote-ref")
+    exp_watchdog.add_argument("--ssh-key")
+    exp_watchdog.add_argument("--ssh-password-file")
+    exp_watchdog.add_argument("--remote-state-root")
+    exp_watchdog.add_argument("--remote-state-path")
+    exp_watchdog.add_argument("--remote-events-path")
+    exp_watchdog.add_argument("--remote-base")
+    exp_watchdog.add_argument("--remote-python")
+    exp_watchdog.add_argument("--no-remote-sync", action="store_true")
+    exp_watchdog.add_argument("--remote-event-tail", type=int, default=200)
+    exp_watchdog.add_argument("--remote-log-tail-lines", type=int, default=120)
+    exp_watchdog.add_argument("--remote-sync-timeout", type=int, default=90)
+    exp_watchdog.add_argument("--no-remote-anomaly-control", action="store_true")
+    exp_watchdog.add_argument("--interval", type=int, default=300, help="Seconds between watchdog checks")
+    exp_watchdog.add_argument("--max-cycles", type=int, default=1, help="Watchdog check cycles")
+    exp_watchdog.add_argument("--stale-seconds", type=int, default=900, help="Run supervision when activity is older than this")
+    exp_watchdog.add_argument("--supervisor-interval", type=int, default=300, help="Interval passed to the one-cycle supervisor")
+    exp_watchdog.add_argument("--no-trigger-next-control", action="store_true")
+    exp_watchdog.add_argument("--no-auto-execute", action="store_true")
+    exp_watchdog.add_argument("--allow-full-train", action="store_true")
+    exp_watchdog.add_argument("--monitor-only", action="store_true", help="Only record remote/local watchdog observations; do not execute tasks or run supervisor")
+    exp_watchdog.add_argument("--control-timeout", type=int, default=1800)
+    exp_watchdog.add_argument("--peer-review-bypass-timeout-seconds", type=int, default=1800)
+    exp_watchdog.add_argument(
+        "--peer-review-bypass-on",
+        default="revise,timeout",
+        help="Comma-separated peer-review outcomes eligible for timed bypass; use 'none' to disable",
+    )
+    exp_watchdog.add_argument(
+        "--peer-review-bypass-classes",
+        default="read-only-preflight,diagnostic-patch,smoke-train,monitor-only,full-train",
+        help="Comma-separated execution classes eligible for timed peer-review bypass",
+    )
+    exp_watchdog.add_argument("--sandbox", choices=sorted(["read-only", "workspace-write", "danger-full-access"]))
+    exp_watchdog.add_argument("--approval-policy", choices=sorted(["untrusted", "on-failure", "on-request", "never"]))
+    exp_watchdog.add_argument("--model")
+    exp_watchdog.add_argument("--reasoning-effort")
+    exp_watchdog.add_argument("--force", action="store_true", help="Run one supervisor cycle even if recent activity is fresh")
+    exp_watchdog.set_defaults(handler=cmd_experiments_watchdog)
 
     research = sub.add_parser("research", help="Manage iterative research threads")
     research_sub = research.add_subparsers(dest="research_command", required=True)
@@ -759,6 +910,52 @@ def cmd_daily_summary(store: Store, args) -> None:
 
 
 def cmd_daemon(store: Store, args) -> None:
+    label = args.launch_agent_label or default_daemon_launch_agent_label(store.path)
+    if args.install_launch_agent:
+        result = install_daemon_launch_agent(
+            db_path=store.path,
+            cwd=Path.cwd(),
+            label=label,
+            interval=args.interval,
+            timeout=args.timeout,
+            allow_full_train=args.allow_full_train,
+            notify_telegram=not args.no_telegram_notify,
+            telegram_token_file=args.telegram_token_file,
+            telegram_token_env=args.telegram_token_env,
+            telegram_proxy_url=args.telegram_proxy_url,
+            log_dir=args.launch_agent_log_dir,
+            bootstrap=not args.no_bootstrap,
+        )
+        print(f"Installed LaunchAgent {result['label']}: {result['path']}")
+        for command in result["commands"]:
+            print(
+                "  "
+                + " ".join(command["args"])
+                + f" -> {command['returncode']}"
+                + (f" stderr={command['stderr'].strip()}" if command.get("stderr") else "")
+            )
+        return
+    if args.uninstall_launch_agent:
+        result = uninstall_daemon_launch_agent(db_path=store.path, label=label)
+        print(f"Uninstalled LaunchAgent {result['label']}: removed={result['removed']} path={result['path']}")
+        for command in result["commands"]:
+            print(
+                "  "
+                + " ".join(command["args"])
+                + f" -> {command['returncode']}"
+                + (f" stderr={command['stderr'].strip()}" if command.get("stderr") else "")
+            )
+        return
+    if args.launch_agent_status:
+        result = daemon_launch_agent_status(db_path=store.path, label=label)
+        print(
+            f"LaunchAgent {result['label']}: installed={result['installed']} "
+            f"loaded={result['loaded']} path={result['path']}"
+        )
+        launchctl = result["launchctl"]
+        if launchctl.get("stderr"):
+            print(f"launchctl stderr: {launchctl['stderr'].strip()}")
+        return
     print(f"mycodex daemon started; db={store.path}; interval={args.interval}s")
     run_daemon(
         store,
@@ -881,7 +1078,8 @@ def cmd_rules_list(store: Store, args) -> None:
     for row in rows:
         schedule = row["time_of_day"] or f"every {row['interval_seconds']}s"
         enabled = "on" if row["enabled"] else "off"
-        print(f"{row['project_name']}\t{row['name']}\t{row['kind']}\t{enabled}\t{schedule}")
+        thread = row["thread_id"] or "-"
+        print(f"{row['project_name']}\t{row['name']}\t{row['kind']}\t{enabled}\t{schedule}\tthread={thread}")
 
 
 def cmd_rules_add(store: Store, args) -> None:
@@ -892,12 +1090,33 @@ def cmd_rules_add(store: Store, args) -> None:
         project["id"],
         name=args.name,
         kind=args.kind,
+        thread_id=args.thread_id,
         time_of_day=args.time_of_day,
         interval_seconds=args.interval_seconds,
         prompt=args.prompt,
         enabled=not args.disabled,
     )
     print(f"Rule {args.name} saved for {args.project}.")
+
+
+def cmd_rules_watch(store: Store, args) -> None:
+    print(
+        f"mycodex rule watch started; db={store.path}; "
+        f"project={args.project}; rule={args.name}; interval={args.interval}s",
+        flush=True,
+    )
+    run_single_rule_watch(
+        store,
+        args.project,
+        args.name,
+        interval_seconds=args.interval,
+        once=args.once,
+        timeout=args.timeout,
+        notify_telegram=not args.no_telegram_notify,
+        telegram_token_file=args.telegram_token_file,
+        telegram_token_env=args.telegram_token_env,
+        telegram_proxy_url=args.telegram_proxy_url,
+    )
 
 
 def cmd_runs_list(store: Store, args) -> None:
@@ -970,6 +1189,36 @@ def cmd_experiments_list(store: Store, args) -> None:
 def cmd_experiments_status(store: Store, args) -> None:
     project = _require_project(store, args.project)
     experiment = _require_experiment(store, project["id"], args.name)
+    events = store.list_experiment_events(experiment["id"], limit=args.limit)
+    _print_experiment_status(experiment, events)
+
+
+def cmd_experiments_watch(store: Store, args) -> None:
+    project = _require_project(store, args.project)
+    try:
+        while True:
+            experiment = _require_experiment(store, project["id"], args.name)
+            event_limit = args.limit if args.include_deltas else max(args.limit * 5, 50)
+            events = store.list_experiment_events(experiment["id"], limit=event_limit)
+            if not args.include_deltas:
+                events = [
+                    event
+                    for event in events
+                    if event["event_type"] != "agent_message_delta"
+                ][: args.limit]
+            if not args.once:
+                print("\033[2J\033[H", end="")
+            print(f"Updated: {format_ts(int(time.time()))}")
+            _print_experiment_status(experiment, events)
+            if args.once:
+                break
+            sys.stdout.flush()
+            time.sleep(max(1.0, args.interval))
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+def _print_experiment_status(experiment, events) -> None:
     print(f"Experiment: #{experiment['id']} {experiment['name']}")
     print(f"Project: {experiment['project_name']}")
     print(f"Status: {experiment['status']}")
@@ -985,7 +1234,6 @@ def cmd_experiments_status(store: Store, args) -> None:
     print(f"Remote: {experiment['remote_ref'] or '-'}")
     if experiment["objective"]:
         print(f"Objective: {experiment['objective']}")
-    events = store.list_experiment_events(experiment["id"], limit=args.limit)
     if not events:
         print("No events.")
         return
@@ -1045,9 +1293,110 @@ def cmd_experiments_start(store: Store, args) -> None:
         reasoning_effort=args.reasoning_effort,
     )
     print(f"Run #{result['run_id']} {result['status']} thread={result['thread_id']}")
+    contract = extract_execution_contract(result.get("output_text") or "")
+    if contract is not None:
+        task_record = record_execution_contract_task(
+            store,
+            args.project,
+            args.name,
+            contract,
+            trigger="manual_start",
+            auto_execute_policy=True,
+            run_id=result.get("run_id") if isinstance(result.get("run_id"), int) else None,
+            context_key=str(result.get("turn_id") or result.get("run_id") or ""),
+            source="mycodex-cli",
+        )
+        print(
+            f"Protocol task #{task_record['task']['id']} "
+            f"{task_record['task']['status']} "
+            f"class={task_record['task']['execution_class'] or '-'}"
+        )
     if result["output_text"]:
         print()
         print(result["output_text"])
+
+
+def cmd_experiments_task_list(store: Store, args) -> None:
+    project = _require_project(store, args.project)
+    experiment = _require_experiment(store, project["id"], args.name)
+    tasks = store.list_experiment_tasks(
+        experiment["id"],
+        statuses=args.status or None,
+        limit=args.limit,
+    )
+    if not tasks:
+        print("No experiment protocol tasks.")
+        return
+    for task in tasks:
+        print(
+            f"#{task['id']}\t{task['status']}\t{task['task_type']}\t"
+            f"class={task['execution_class'] or '-'}\tattempts={task['attempts']}/{task['max_attempts']}\t"
+            f"lease={task['lease_owner'] or '-'}\tupdated={format_ts(task['updated_at'])}"
+        )
+
+
+def cmd_experiments_task_approve(store: Store, args) -> None:
+    project = _require_project(store, args.project)
+    experiment = _require_experiment(store, project["id"], args.name)
+    task = store.get_experiment_task(experiment["id"], args.task_id)
+    if task is None:
+        raise ValueError(f"unknown experiment task #{args.task_id}")
+    if task["status"] not in {"proposed", "blocked"}:
+        raise ValueError(f"task #{args.task_id} is {task['status']}, not proposed/blocked")
+    updated = store.update_experiment_task_status(experiment["id"], args.task_id, "ready")
+    store.add_experiment_event(
+        experiment["id"],
+        event_type="experiment_task_approved",
+        level="info",
+        message=f"Experiment task #{args.task_id} approved for execution.",
+        payload={"task_id": args.task_id, "previous_status": task["status"]},
+        source="manual",
+        status="running",
+        phase="checking_git",
+        phase_message="A protocol task was approved and is ready for worker execution.",
+    )
+    print(f"Experiment task #{updated['id']} -> {updated['status']}.")
+
+
+def cmd_experiments_task_run(store: Store, args) -> None:
+    result = run_ready_experiment_tasks(
+        store,
+        args.project,
+        args.name,
+        owner=args.owner,
+        lease_seconds=args.lease_seconds,
+        max_tasks=args.max_tasks,
+        ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
+        remote_ref=args.remote_ref,
+        remote_python=args.remote_python,
+        allow_full_train=args.allow_full_train,
+    )
+    print(f"Executed protocol tasks: {result['executed_tasks']}")
+    for item in result["tasks"]:
+        task = item["task"]
+        execution = item.get("execution") or {}
+        print(
+            f"  #{task['id']} {task['status']} reason={execution.get('reason') or '-'} "
+            f"launch={bool(execution.get('launch'))}"
+        )
+
+
+def cmd_experiments_task_recover(store: Store, args) -> None:
+    result = recover_stale_experiment_tasks(
+        store,
+        project_name=args.project,
+        experiment_name=args.name,
+        running_timeout_seconds=args.running_timeout_seconds,
+        source="mycodex-cli",
+    )
+    print(f"Recovered protocol tasks: {result['recovered_tasks']}")
+    for item in result["tasks"]:
+        print(
+            f"  {item['project']}/{item['experiment']} "
+            f"#{item['task_id']} {item['previous_status']} -> {item['status']} "
+            f"reason={item['reason']}"
+        )
 
 
 def cmd_experiments_git_push(store: Store, args) -> None:
@@ -1119,6 +1468,33 @@ def cmd_experiments_remote_status(store: Store, args) -> None:
         print(result["stdout"])
 
 
+def cmd_experiments_sync_remote(store: Store, args) -> None:
+    result = sync_remote_experiment_state(
+        store,
+        args.project,
+        args.name,
+        remote_ref=args.remote_ref,
+        ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
+        remote_state_root=args.remote_state_root,
+        remote_state_path=args.remote_state_path,
+        remote_events_path=args.remote_events_path,
+        remote_base=args.remote_base,
+        remote_python=args.remote_python,
+        event_tail=args.event_tail,
+        log_tail_lines=args.log_tail_lines,
+        stale_seconds=args.stale_seconds,
+        timeout=args.timeout,
+    )
+    print(
+        f"Remote sync status={result.get('sync_status')} "
+        f"events={result.get('remote_events_imported', 0)} "
+        f"anomalies={len(result.get('control_anomalies') or [])}"
+    )
+    if result.get("batch_fingerprint"):
+        print(f"Anomaly fingerprint: {result['batch_fingerprint']}")
+
+
 def cmd_experiments_poll_wandb(store: Store, args) -> None:
     result = poll_wandb_run(
         store,
@@ -1159,6 +1535,7 @@ def cmd_experiments_supervise(store: Store, args) -> None:
         remote_ref=args.remote_ref,
         ssh_key=args.ssh_key,
         ssh_password_file=args.ssh_password_file,
+        remote_python=args.remote_python,
         remote_pid=args.pid,
         remote_log_path=args.log_path,
         interval=args.interval,
@@ -1171,6 +1548,9 @@ def cmd_experiments_supervise(store: Store, args) -> None:
         control_approval_policy=args.approval_policy,
         control_model=args.model,
         control_reasoning_effort=args.reasoning_effort,
+        peer_review_bypass_timeout_seconds=args.peer_review_bypass_timeout_seconds,
+        peer_review_bypass_on=args.peer_review_bypass_on,
+        peer_review_bypass_allowed_classes=args.peer_review_bypass_classes,
     )
     print(
         f"Supervisor cycle={result.get('cycle')} "
@@ -1179,6 +1559,56 @@ def cmd_experiments_supervise(store: Store, args) -> None:
     )
     if result.get("matched_stop_conditions"):
         print("Matched stop conditions: " + ", ".join(result["matched_stop_conditions"]))
+
+
+def cmd_experiments_watchdog(store: Store, args) -> None:
+    result = run_experiment_watchdog(
+        store,
+        args.project,
+        experiment_name=args.name,
+        run_path=args.run_path,
+        metrics=args.metric,
+        stop_conditions=args.stop_condition,
+        fail_on_nonfinite=not args.no_fail_on_nonfinite,
+        complete_on_finish=args.complete_on_finish,
+        remote_ref=args.remote_ref,
+        ssh_key=args.ssh_key,
+        ssh_password_file=args.ssh_password_file,
+        remote_state_root=args.remote_state_root,
+        remote_state_path=args.remote_state_path,
+        remote_events_path=args.remote_events_path,
+        remote_base=args.remote_base,
+        remote_python=args.remote_python,
+        remote_sync=not args.no_remote_sync,
+        remote_event_tail=args.remote_event_tail,
+        remote_log_tail_lines=args.remote_log_tail_lines,
+        remote_sync_timeout=args.remote_sync_timeout,
+        remote_anomaly_control=not args.no_remote_anomaly_control,
+        interval=args.interval,
+        max_cycles=args.max_cycles,
+        stale_seconds=args.stale_seconds,
+        supervisor_interval=args.supervisor_interval,
+        trigger_next_control=not args.no_trigger_next_control,
+        auto_execute=not args.no_auto_execute,
+        allow_full_train=args.allow_full_train,
+        monitor_only=args.monitor_only,
+        control_timeout=args.control_timeout,
+        control_sandbox=args.sandbox,
+        control_approval_policy=args.approval_policy,
+        control_model=args.model,
+        control_reasoning_effort=args.reasoning_effort,
+        peer_review_bypass_timeout_seconds=args.peer_review_bypass_timeout_seconds,
+        peer_review_bypass_on=args.peer_review_bypass_on,
+        peer_review_bypass_allowed_classes=args.peer_review_bypass_classes,
+        force=args.force,
+    )
+    print(f"Watchdog cycle={result.get('cycle')} experiments={len(result.get('experiments') or [])}")
+    for item in result.get("experiments") or []:
+        print(
+            f"  {item.get('experiment')} action={item.get('action')} "
+            f"reason={item.get('reason') or '-'} activity={item.get('activity_event') or '-'} "
+            f"age={item.get('activity_age_seconds')}"
+        )
 
 
 def cmd_research_create(store: Store, args) -> None:
@@ -1190,13 +1620,14 @@ def cmd_research_create(store: Store, args) -> None:
             "run `mycodex sessions sync` if this is unexpected.",
             file=sys.stderr,
         )
+    config = _parse_json_object(args.config_json)
     research = store.add_research_thread(
         project["id"],
         name=args.name,
         thread_id=args.thread_id,
         question=args.question,
         max_iterations=args.max_iterations,
-        config=_parse_json_object(args.config_json),
+        config=config,
         status=args.status,
     )
     store.add_research_event(
@@ -1207,10 +1638,29 @@ def cmd_research_create(store: Store, args) -> None:
         source="mycodex",
         status=args.status,
     )
+    preflight_task_id = None
+    if config.get("concept_preflight") is not False:
+        preflight_task_id = ensure_research_concept_preflight_task(
+            store,
+            args.project,
+            args.name,
+            auto_queue_search=bool(config.get("auto_queue_initial_search", False)),
+        )
+        if preflight_task_id:
+            store.add_research_event(
+                research["id"],
+                event_type="task_queued",
+                message=f"Task #{preflight_task_id}: concept_preflight",
+                payload={"task_id": preflight_task_id, "auto_queue_initial_search": bool(config.get("auto_queue_initial_search", False))},
+                source="mycodex",
+                phase="concept_preflight",
+            )
     print(
         f"Research #{research['id']} {research['name']} "
         f"{research['status']} thread={research['thread_id']}"
     )
+    if preflight_task_id:
+        print(f"Queued concept preflight task #{preflight_task_id}.")
     path = write_research_markdown(store, args.project, args.name)
     print(f"Markdown: {path}")
 
@@ -1419,6 +1869,8 @@ def cmd_research_update(store: Store, args) -> None:
         f"Research update queued for {result['project']}/{result['name']} "
         f"task=#{result['task_id']}"
     )
+    if result.get("preflight_task_id"):
+        print(f"Queued concept preflight task #{result['preflight_task_id']}.")
     matches = result.get("matches") or []
     if matches:
         match = matches[0]

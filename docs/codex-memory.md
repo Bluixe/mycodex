@@ -23,6 +23,65 @@ pitfalls that should be easy to update.
   smoke training, the outer control plane may commit/push intended changes,
   launch the remote job, and monitor stop conditions without another user
   confirmation.
+- Experiment execution contracts are persisted as durable protocol tasks in
+  `experiment_tasks`. The bound Codex session proposes a contract; the outer
+  control plane records it as `proposed`, `ready`, or `blocked`; and only a
+  leased `ready` task is executed. This keeps consensus, wakeup, execution, and
+  completion states in SQLite instead of relying on an implicit phase label
+  such as `eval_pending`.
+- Training contracts must be hypothesis-driven rather than hyperparameter
+  fishing. For `smoke-train` and `full-train`, the execution contract must
+  include a `research` block with a falsifiable hypothesis, mechanism,
+  baseline, intervention, predictions, controls, support/falsification/
+  ambiguity criteria, analysis plan, and anti-sweep rationale. The outer
+  control plane refuses incomplete training contracts before launching remote
+  work.
+- The `icrl/procgen-multi-env-icl` experiment has a durable research handoff at
+  `docs/procgen-multi-env-icl-research-handoff.md`. Future control turns must
+  treat the accepted mechanism as competence/phase-coordinate conditioning, not
+  raw-return matching, and should avoid naive hyperparameter sweeps. Resume via
+  `train_completed -> eval_pending -> launch_eval -> result_gate ->
+  next_research_decision`.
+- Experiment iteration should use a peer Codex review gate before execution
+  instead of repeatedly waiting for user approval. After drafting a minimal
+  implementation, diagnostic validation, smoke run, or larger experiment plan,
+  start or resume a separate Codex session with the project background, current
+  metrics, proposed contract, expected runtime/cost, risks, and rationale.
+  Incorporate its critique, record the resulting decision/contract, then
+  execute directly when the contract is complete and within the user's standing
+  authorization.
+- The peer review gate should produce actionable objections or approval, not
+  open-ended discussion. If the reviewer flags missing metrics, unclear stop
+  conditions, unsafe file changes, uncertain remote state, or excessive cost,
+  revise the plan or run a cheaper diagnostic first. Escalate to the user only
+  for credentials, billing/quota changes, destructive or unrelated-data
+  operations, or genuinely ambiguous research direction.
+- Peer review must not have an unbounded veto over authorized experiment
+  progress. The default timed bypass policy is explicit: after 1800 seconds of
+  `revise` or peer-review timeout, the control plane may bypass review only if
+  the execution contract is complete, the class is allowed by policy, `block`
+  was not returned, and `full-train` has explicit `allow_full_train`. The
+  bypass decision is recorded as `peer_review_bypass_eligible`,
+  `peer_review_bypassed`, or `peer_review_bypass_denied`.
+- Peer review is now a bounded safety gate, not a general artifact/provenance
+  veto. `eval-only` and `smoke-eval` are read-only, low-risk eval collection
+  classes and skip peer review entirely. Reviewer objections about artifact
+  gates or method claims may set `method_claim_allowed=false`, but must not
+  block eval data collection. Peer review may block only destructive
+  operations, unauthorized long/paid training, or overwriting/committing
+  unowned local changes. Consecutive `revise` is capped at one automatic
+  revision; the next `revise` either executes a safe fallback contract or
+  records `paused_with_reviewer_objections` instead of opening more Codex
+  sessions.
+- Dirty local worktrees only block contracts that need local patch/commit. An
+  `eval-only` or `smoke-eval` contract that explicitly binds an already-pushed
+  `commit`/`remote.commit` may launch remote eval from that commit even when
+  unrelated local files are dirty.
+- Terminal train completion should progress through
+  `train_completed -> eval_pending -> launch_eval -> result_gate ->
+  next_research_decision`. The control plane should not route terminal train
+  completion through repeated peer-review/block loops before collecting eval
+  data.
 - Prefer service-layer helpers in `mycodex/service.py` over duplicating DB or
   app-server protocol logic in CLI, web, daemon, or Telegram code.
 - Project defaults are conservative by design: `read-only` sandbox and
@@ -37,10 +96,115 @@ pitfalls that should be easy to update.
 - Experiment automation now has control-plane commands for local git push,
   remote SSH launch/status, and W&B polling:
   `experiments git-push`, `experiments launch-remote`,
-  `experiments remote-status`, and `experiments poll-wandb`.
+  `experiments remote-status`, `experiments sync-remote`,
+  `experiments poll-wandb`, and `experiments watchdog`. Durable protocol tasks
+  are inspected and operated with `experiments task-list`,
+  `experiments task-approve`, `experiments task-run`, and
+  `experiments task-recover`. Local restart recovery is intentionally
+  conservative: expired `leased` tasks go back to `ready`; stale `running`
+  tasks go back to `ready` only if no remote launch/monitor event mentions the
+  protocol task id. If the task already touched remote execution, recovery
+  marks it `blocked` for an explicit control decision before retry.
+- Watchdog checks for `ready` protocol tasks before stale-supervisor fallback.
+  A complete eval/preflight contract can therefore be woken up and executed
+  even when no current remote PID, log path, or W&B target exists.
+- Use `experiments watch --project NAME --name EXPERIMENT --interval 10` or
+  the project page in the local web dashboard to monitor control/review
+  progression without returning to the controlling chat session.
+- For self-iterating experiments, do not rely on a single long-lived supervisor
+  process. Run `experiments watchdog` as a separate local background process
+  with a stale threshold; it writes `watchdog_heartbeat`,
+  `watchdog_skipped`, `watchdog_supervise_started`, and
+  `watchdog_supervise_completed` events, and starts a one-cycle supervisor when
+  recent supervisor/control/Codex activity is stale. This is the concrete
+  evidence path for "background auto-continue" behavior.
+- Experiments can also be watched by `mycodex daemon` directly when the
+  experiment `config_json` contains `{"watchdog": {"enabled": true, ...}}`.
+  The daemon writes `experiment_watchdog_daemon_started`,
+  `experiment_watchdog_daemon_completed`, or
+  `experiment_watchdog_daemon_failed` before/after calling the same
+  `run_experiment_watchdog` control path. This is the preferred durable
+  ownership path when the user expects mycodex itself to keep checking without
+  a separate hand-started watchdog shell. To avoid duplicate control turns, the
+  daemon also treats recent `watchdog_heartbeat`,
+  `watchdog_supervise_started`, and `remote_anomaly_control_started` rows from
+  an external LaunchAgent watchdog as satisfying the configured interval.
+  Experiment watchdogs run before daily summaries and scheduled rules, so a
+  slow daily-summary Codex turn cannot delay experiment continuation.
+  Before starting a new cycle, the daemon also checks for active
+  `experiment:<id>:` runs. A recent active control/review/repair run causes an
+  `experiment_watchdog_daemon_skipped_active_control` event to avoid duplicate
+  Codex turns; a run older than `control_timeout + 60s` is marked failed with
+  `experiment_control_run_marked_stale`, then the watchdog retries.
+  The same active-run lease is also enforced inside `experiments watchdog`
+  itself via `experiment_watchdog_skipped_active_control`, so LaunchAgent,
+  daemon, and manual watchdog invocations share the duplicate-control guard.
+  macOS reboot protection is provided by `mycodex daemon
+  --install-launch-agent`, which writes a per-user LaunchAgent with
+  `RunAtLoad` and `KeepAlive` and starts the same daemon command after login.
+  Each daemon pass runs stale protocol-task recovery before watchdogs, daily
+  summaries, or scheduled rules.
+  Use `watchdog.monitor_only=true` when the daemon should only recover stale
+  local leases and record heartbeat/anomaly evidence; monitor-only passes do
+  not execute ready protocol tasks, run supervisor cycles, or start control
+  turns.
+- When an experiment has a configured remote controller root, watchdog first
+  runs `sync-remote` semantics against the remote machine and imports
+  `state.json`, `events.jsonl`, pidfiles, summary rows, contract/env hashes,
+  command hashes, GPU state, host boot id/uptime, and short log tails.
+  Successful sync writes
+  `remote_heartbeat` and deduped `remote_event` rows; SSH/Python/network
+  failures write `remote_sync_failed` and must not trigger control by
+  themselves. If the configured root is empty or stale but its base directory
+  contains newer controller `state.json`/`events.jsonl` files, remote sync
+  discovers the newest valid root instead of repeatedly reporting a false empty
+  controller. New remote anomalies are fingerprinted persistently in SQLite.
+  A changed remote boot id, or a fresh boot with no live controller processes
+  and incomplete structured work, is a control anomaly; terminal-complete
+  snapshots only observe the boot change.
+  Terminal-complete anomaly fingerprints are based on stable run/eval/artifact
+  identity and ignore drifting log-tail hashes; log-tail hashes only affect
+  the fingerprint for actual log-failure anomalies.
+- `remote_heartbeat` is remote-observation evidence, not supervisor freshness.
+  It must not by itself prevent W&B polling or a stale one-cycle supervisor
+  check. If the remote snapshot shows active work and no W&B target is known,
+  the watchdog may skip with reason `remote_active`; otherwise stale
+  supervisor/control activity should still be eligible for a supervisor pass.
+- Remote anomaly continuation is control-plane driven, not a direct remote
+  kill/restart. A new anomaly fingerprint writes `remote_anomaly`, starts the
+  bound control session, repairs unparseable contracts if needed, runs the peer
+  review gate, and only then executes a complete approved contract.
+- Monitor-only contracts are not successful control cycles unless the remote
+  command actually succeeds. A failed `remote_monitor_command_failed` must also
+  write `remote_anomaly_control_failed`, so duplicate-control guards do not
+  treat the anomaly as handled. When `remote_python` is configured, contract
+  remote commands are prefixed with `MYCODEX_REMOTE_PYTHON` and the Python
+  environment's `bin` directory on `PATH`, so bare `python`/`python3` probes use
+  the intended remote env.
+- Local result gates such as `result_gate_parsed` can be continuation
+  conditions. If the latest gate says training is blocked, manual review is
+  required, or manifest repair is needed, watchdog starts a new control cycle
+  even when the remote terminal anomaly itself is a duplicate.
+- A complete terminal remote snapshot that is merely ready for the next
+  decision is an info-level continuation condition, not an error-level crash.
+  Treat `remote_terminal_complete_ready_for_next` as result-analysis/next-run
+  input unless artifacts are actually missing or logs show failure.
 - Remote experiment launch records PID/log/commit in `remote_job_started`.
   W&B polling records compact `metric` events plus `decision`, `failed`, or
   `wandb_run_finished` events when conditions are reached.
+- Remote summary expected-row defaults should come from experiment config or
+  remote contract fields (`eval_epochs`, `eval_envs`, `EVAL_EPOCHS`,
+  `EVAL_ENVS`, `HELDOUT_ENVS`). Do not hard-code Procgen environment names in
+  the generic remote sync path.
+- Experiment control loops should log the peer-review prompt, reviewer
+  conclusion, final execution contract, and reason for any deviation as
+  experiment events so later sessions can reconstruct why a run was launched.
+- Experiment control contract parsing is a recoverable control-plane failure,
+  not a reason to strand an experiment. If the bound Codex session returns an
+  unparseable execution contract, the supervisor records
+  `control_contract_parse_failed`, starts a focused `contract_repair` turn, and
+  retries the same terminal condition on the next supervisor cycle if repair
+  still fails.
 - Remote experiment commands can use `--ssh-password-file` for password-only
   servers. Keep the password under ignored local `data/secrets/`, require the
   local `expect` binary, and record only the auth mode, never the password.
@@ -63,6 +227,12 @@ pitfalls that should be easy to update.
   summaries, and local synthesis from retained sources into claim and idea
   ledgers. This is deliberately heuristic and should be followed by deeper
   source reading before major research commitments.
+- Research threads must now pass a concept preflight before normal search,
+  synthesis, or idea ranking: define mechanism axes, query families, synonym
+  expansions, anchor promotion criteria, and exact/partial/adjacent/irrelevant
+  threat rules. This was added after the `LLM+in-context RL` thread showed that
+  literal keyword search could over-promote SKILL0 while under-promoting LaMer
+  and MAGE.
 - The local research worker also supports refinement tasks:
   `deep_read_top` ingests top retained sources, `threat_search` finds nearest
   related work for idea ids, and `idea_critique` writes feasibility, novelty,

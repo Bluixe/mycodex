@@ -143,6 +143,33 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_experiment_events_experiment_created
                 ON experiment_events(experiment_id, created_at DESC, id DESC);
 
+            CREATE TABLE IF NOT EXISTS experiment_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id INTEGER NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+                task_type TEXT NOT NULL DEFAULT 'execution_contract',
+                status TEXT NOT NULL DEFAULT 'proposed',
+                execution_class TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL,
+                contract_json TEXT NOT NULL DEFAULT '{}',
+                source_event_id INTEGER REFERENCES experiment_events(id) ON DELETE SET NULL,
+                run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_expires_at INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                ready_at INTEGER,
+                started_at INTEGER,
+                completed_at INTEGER,
+                UNIQUE(experiment_id, idempotency_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_experiment_tasks_experiment_status
+                ON experiment_tasks(experiment_id, status, updated_at DESC, id DESC);
+
             CREATE TABLE IF NOT EXISTS research_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -280,6 +307,7 @@ class Store:
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL,
+                thread_id TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 time_of_day TEXT,
                 interval_seconds INTEGER,
@@ -345,6 +373,7 @@ class Store:
         self._ensure_column("experiments", "latest_decision", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("experiments", "last_metric_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("experiments", "artifact_ref", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("rules", "thread_id", "TEXT")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -624,6 +653,34 @@ class Store:
             params,
         ).fetchone()
 
+    def active_runs_for_project(
+        self,
+        project_id: int,
+        *,
+        kind_prefix: str | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [project_id]
+        kind_clause = ""
+        if kind_prefix:
+            kind_clause = "AND runs.kind LIKE ?"
+            params.append(f"{kind_prefix}%")
+        params.append(limit)
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT runs.*, projects.name AS project_name
+                FROM runs
+                JOIN projects ON projects.id = runs.project_id
+                WHERE runs.project_id = ? AND runs.status = 'running'
+                {kind_clause}
+                ORDER BY runs.started_at DESC
+                LIMIT ?
+                """,
+                params,
+            )
+        )
+
     def add_experiment(
         self,
         project_id: int,
@@ -790,68 +847,72 @@ class Store:
         if iteration is not None and iteration < 0:
             raise ValueError("experiment iteration must be non-negative")
         ts = now_ts()
-        cur = self.conn.execute(
-            """
-            INSERT INTO experiment_events (
-                experiment_id, iteration, event_type, level, message,
-                payload_json, source, run_id, created_at
+        try:
+            cur = self.conn.execute(
+                """
+                INSERT INTO experiment_events (
+                    experiment_id, iteration, event_type, level, message,
+                    payload_json, source, run_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    experiment_id,
+                    iteration,
+                    event_type,
+                    level,
+                    message.strip(),
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    source.strip() or "manual",
+                    run_id,
+                    ts,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                experiment_id,
-                iteration,
-                event_type,
-                level,
-                message.strip(),
-                json.dumps(payload or {}, ensure_ascii=False),
-                source.strip() or "manual",
-                run_id,
-                ts,
-            ),
-        )
-        fields = ["updated_at = ?"]
-        params: list[Any] = [ts]
-        if iteration is not None:
-            fields.append("current_iteration = MAX(current_iteration, ?)")
-            params.append(iteration)
-        if status is not None:
-            status = _validate_experiment_status(status)
-            fields.append("status = ?")
-            params.append(status)
-            if phase is None and _phase_for_event(event_type, None) is None:
-                phase = _phase_for_status(status)
-            if status == "running":
-                fields.append("started_at = COALESCE(started_at, ?)")
-                params.append(ts)
-            if status in {"completed", "failed"}:
-                fields.append("completed_at = ?")
-                params.append(ts)
-        resolved_phase = _phase_for_event(event_type, phase)
-        if resolved_phase is not None:
-            fields.append("phase = ?")
-            params.append(resolved_phase)
-        resolved_message = phase_message or _phase_message_for_event(event_type, message)
-        if resolved_message:
-            fields.append("phase_message = ?")
-            params.append(resolved_message)
-        if event_type in {"decision", "blocked", "failed", "completed", "wandb_run_finished"} and message.strip():
-            fields.append("latest_decision = ?")
-            params.append(message.strip())
-        if event_type == "metric":
-            fields.append("last_metric_json = ?")
-            params.append(json.dumps(payload or {}, ensure_ascii=False))
-        artifact = _artifact_ref_for_event(event_type, payload or {})
-        if artifact:
-            fields.append("artifact_ref = ?")
-            params.append(artifact)
-        params.append(experiment_id)
-        self.conn.execute(
-            f"UPDATE experiments SET {', '.join(fields)} WHERE id = ?",
-            params,
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+            fields = ["updated_at = ?"]
+            params: list[Any] = [ts]
+            if iteration is not None:
+                fields.append("current_iteration = MAX(current_iteration, ?)")
+                params.append(iteration)
+            if status is not None:
+                status = _validate_experiment_status(status)
+                fields.append("status = ?")
+                params.append(status)
+                if phase is None and _phase_for_event(event_type, None) is None:
+                    phase = _phase_for_status(status)
+                if status == "running":
+                    fields.append("started_at = COALESCE(started_at, ?)")
+                    params.append(ts)
+                if status in {"completed", "failed"}:
+                    fields.append("completed_at = ?")
+                    params.append(ts)
+            resolved_phase = _phase_for_event(event_type, phase)
+            if resolved_phase is not None:
+                fields.append("phase = ?")
+                params.append(resolved_phase)
+            resolved_message = phase_message or _phase_message_for_event(event_type, message)
+            if resolved_message:
+                fields.append("phase_message = ?")
+                params.append(resolved_message)
+            if event_type in {"decision", "blocked", "failed", "completed", "wandb_run_finished"} and message.strip():
+                fields.append("latest_decision = ?")
+                params.append(message.strip())
+            if event_type == "metric":
+                fields.append("last_metric_json = ?")
+                params.append(json.dumps(payload or {}, ensure_ascii=False))
+            artifact = _artifact_ref_for_event(event_type, payload or {})
+            if artifact:
+                fields.append("artifact_ref = ?")
+                params.append(artifact)
+            params.append(experiment_id)
+            self.conn.execute(
+                f"UPDATE experiments SET {', '.join(fields)} WHERE id = ?",
+                params,
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def list_experiment_events(
         self,
@@ -872,6 +933,345 @@ class Store:
                 (experiment_id, limit),
             )
         )
+
+    def get_latest_experiment_event(
+        self,
+        experiment_id: int,
+        event_type: str,
+    ) -> sqlite3.Row | None:
+        event_type = event_type.strip()
+        if not event_type:
+            raise ValueError("experiment event_type is required")
+        return self.conn.execute(
+            """
+            SELECT experiment_events.*, runs.status AS run_status
+            FROM experiment_events
+            LEFT JOIN runs ON runs.id = experiment_events.run_id
+            WHERE experiment_events.experiment_id = ?
+              AND experiment_events.event_type = ?
+            ORDER BY experiment_events.created_at DESC, experiment_events.id DESC
+            LIMIT 1
+            """,
+            (experiment_id, event_type),
+        ).fetchone()
+
+    def upsert_experiment_task(
+        self,
+        experiment_id: int,
+        *,
+        task_type: str = "execution_contract",
+        status: str = "proposed",
+        execution_class: str = "",
+        idempotency_key: str,
+        contract: dict[str, Any] | None = None,
+        source_event_id: int | None = None,
+        run_id: int | None = None,
+        max_attempts: int = 3,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> sqlite3.Row:
+        task_type = task_type.strip() or "execution_contract"
+        status = _validate_experiment_task_status(status)
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key:
+            raise ValueError("experiment task idempotency_key is required")
+        if max_attempts < 1:
+            raise ValueError("experiment task max_attempts must be positive")
+        ts = now_ts()
+        ready_at = ts if status == "ready" else None
+        completed_at = ts if status in EXPERIMENT_TASK_TERMINAL_STATUSES else None
+        payload = json.dumps(contract or {}, ensure_ascii=False, sort_keys=True)
+        result_json = json.dumps(result or {}, ensure_ascii=False, sort_keys=True)
+        try:
+            if source_event_id is not None:
+                source_event = self.conn.execute(
+                    """
+                    SELECT id
+                    FROM experiment_events
+                    WHERE id = ? AND experiment_id = ?
+                    """,
+                    (source_event_id, experiment_id),
+                ).fetchone()
+                if source_event is None:
+                    source_event_id = None
+            if run_id is not None and self.get_run(run_id) is None:
+                run_id = None
+            existing = self.conn.execute(
+                """
+                SELECT *
+                FROM experiment_tasks
+                WHERE experiment_id = ? AND idempotency_key = ?
+                """,
+                (experiment_id, idempotency_key),
+            ).fetchone()
+            if existing is None:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO experiment_tasks (
+                        experiment_id, task_type, status, execution_class,
+                        idempotency_key, contract_json, source_event_id, run_id,
+                        max_attempts, result_json, error, created_at, updated_at,
+                        ready_at, completed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        experiment_id,
+                        task_type,
+                        status,
+                        execution_class.strip(),
+                        idempotency_key,
+                        payload,
+                        source_event_id,
+                        run_id,
+                        max_attempts,
+                        result_json,
+                        error.strip(),
+                        ts,
+                        ts,
+                        ready_at,
+                        completed_at,
+                    ),
+                )
+                task_id = int(cur.lastrowid)
+            else:
+                task_id = int(existing["id"])
+                if existing["status"] not in EXPERIMENT_TASK_TERMINAL_STATUSES:
+                    self.conn.execute(
+                        """
+                        UPDATE experiment_tasks
+                        SET task_type = ?,
+                            status = ?,
+                            execution_class = ?,
+                            contract_json = ?,
+                            source_event_id = COALESCE(?, source_event_id),
+                            run_id = COALESCE(?, run_id),
+                            max_attempts = ?,
+                            result_json = ?,
+                            error = ?,
+                            updated_at = ?,
+                            ready_at = CASE
+                                WHEN ? = 'ready' THEN COALESCE(ready_at, ?)
+                                ELSE ready_at
+                            END,
+                            completed_at = CASE
+                                WHEN ? IN ('succeeded', 'failed', 'blocked', 'cancelled') THEN COALESCE(completed_at, ?)
+                                ELSE NULL
+                            END
+                        WHERE id = ?
+                        """,
+                        (
+                            task_type,
+                            status,
+                            execution_class.strip(),
+                            payload,
+                            source_event_id,
+                            run_id,
+                            max_attempts,
+                            result_json,
+                            error.strip(),
+                            ts,
+                            status,
+                            ts,
+                            status,
+                            ts,
+                            task_id,
+                        ),
+                    )
+            self.conn.commit()
+            task = self.get_experiment_task(experiment_id, task_id)
+            if task is None:
+                raise RuntimeError("experiment task insert failed")
+            return task
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_experiment_task(self, experiment_id: int, task_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT *
+            FROM experiment_tasks
+            WHERE experiment_id = ? AND id = ?
+            """,
+            (experiment_id, task_id),
+        ).fetchone()
+
+    def list_experiment_tasks(
+        self,
+        experiment_id: int,
+        *,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        clauses = ["experiment_id = ?"]
+        params: list[Any] = [experiment_id]
+        if statuses:
+            normalized = [_validate_experiment_task_status(status) for status in statuses]
+            placeholders = ", ".join("?" for _ in normalized)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(normalized)
+        params.append(limit)
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT *
+                FROM experiment_tasks
+                WHERE {" AND ".join(clauses)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+        )
+
+    def lease_next_experiment_task(
+        self,
+        experiment_id: int,
+        *,
+        owner: str,
+        lease_seconds: int = 300,
+        now: int | None = None,
+    ) -> sqlite3.Row | None:
+        owner = owner.strip()
+        if not owner:
+            raise ValueError("experiment task lease owner is required")
+        if lease_seconds < 1:
+            raise ValueError("experiment task lease_seconds must be positive")
+        ts = now_ts() if now is None else int(now)
+        try:
+            task = self.conn.execute(
+                """
+                SELECT *
+                FROM experiment_tasks
+                WHERE experiment_id = ?
+                  AND attempts < max_attempts
+                  AND (
+                    status = 'ready'
+                    OR (status = 'leased' AND COALESCE(lease_expires_at, 0) <= ?)
+                  )
+                ORDER BY ready_at ASC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (experiment_id, ts),
+            ).fetchone()
+            if task is None:
+                return None
+            self.conn.execute(
+                """
+                UPDATE experiment_tasks
+                SET status = 'leased',
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    attempts = attempts + 1,
+                    updated_at = ?,
+                    started_at = COALESCE(started_at, ?)
+                WHERE id = ?
+                """,
+                (owner, ts + lease_seconds, ts, ts, task["id"]),
+            )
+            self.conn.commit()
+            return self.get_experiment_task(experiment_id, int(task["id"]))
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def lease_experiment_task(
+        self,
+        experiment_id: int,
+        task_id: int,
+        *,
+        owner: str,
+        lease_seconds: int = 300,
+        now: int | None = None,
+    ) -> sqlite3.Row | None:
+        owner = owner.strip()
+        if not owner:
+            raise ValueError("experiment task lease owner is required")
+        if lease_seconds < 1:
+            raise ValueError("experiment task lease_seconds must be positive")
+        ts = now_ts() if now is None else int(now)
+        try:
+            task = self.conn.execute(
+                """
+                SELECT *
+                FROM experiment_tasks
+                WHERE experiment_id = ?
+                  AND id = ?
+                  AND attempts < max_attempts
+                  AND (
+                    status = 'ready'
+                    OR (status = 'leased' AND COALESCE(lease_expires_at, 0) <= ?)
+                  )
+                LIMIT 1
+                """,
+                (experiment_id, task_id, ts),
+            ).fetchone()
+            if task is None:
+                return None
+            self.conn.execute(
+                """
+                UPDATE experiment_tasks
+                SET status = 'leased',
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    attempts = attempts + 1,
+                    updated_at = ?,
+                    started_at = COALESCE(started_at, ?)
+                WHERE id = ?
+                """,
+                (owner, ts + lease_seconds, ts, ts, task_id),
+            )
+            self.conn.commit()
+            return self.get_experiment_task(experiment_id, task_id)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_experiment_task_status(
+        self,
+        experiment_id: int,
+        task_id: int,
+        status: str,
+        *,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+        lease_owner: str | None = None,
+    ) -> sqlite3.Row:
+        status = _validate_experiment_task_status(status)
+        ts = now_ts()
+        terminal = status in EXPERIMENT_TASK_TERMINAL_STATUSES
+        fields = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [status, ts]
+        if result is not None:
+            fields.append("result_json = ?")
+            params.append(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        if error:
+            fields.append("error = ?")
+            params.append(error.strip())
+        if lease_owner is not None:
+            fields.append("lease_owner = ?")
+            params.append(lease_owner.strip())
+        if terminal:
+            fields.extend(["completed_at = COALESCE(completed_at, ?)", "lease_owner = ''", "lease_expires_at = NULL"])
+            params.append(ts)
+        elif status == "ready":
+            fields.extend(["ready_at = COALESCE(ready_at, ?)", "lease_owner = ''", "lease_expires_at = NULL"])
+            params.append(ts)
+        params.extend([experiment_id, task_id])
+        self.conn.execute(
+            f"""
+            UPDATE experiment_tasks
+            SET {', '.join(fields)}
+            WHERE experiment_id = ? AND id = ?
+            """,
+            params,
+        )
+        self.conn.commit()
+        task = self.get_experiment_task(experiment_id, task_id)
+        if task is None:
+            raise ValueError(f"unknown experiment task #{task_id}")
+        return task
 
     def add_research_thread(
         self,
@@ -1831,6 +2231,7 @@ class Store:
         *,
         name: str,
         kind: str,
+        thread_id: str | None = None,
         time_of_day: str | None = None,
         interval_seconds: int | None = None,
         prompt: str = "",
@@ -1840,12 +2241,13 @@ class Store:
         self.conn.execute(
             """
             INSERT INTO rules (
-                project_id, name, kind, enabled, time_of_day,
+                project_id, name, kind, thread_id, enabled, time_of_day,
                 interval_seconds, prompt, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, name) DO UPDATE SET
                 kind = excluded.kind,
+                thread_id = excluded.thread_id,
                 enabled = excluded.enabled,
                 time_of_day = excluded.time_of_day,
                 interval_seconds = excluded.interval_seconds,
@@ -1856,6 +2258,7 @@ class Store:
                 project_id,
                 name,
                 kind,
+                thread_id,
                 int(enabled),
                 time_of_day,
                 interval_seconds,
@@ -2131,6 +2534,17 @@ class Store:
 
 TODO_STATUSES = {"open", "doing", "blocked", "done", "archived"}
 EXPERIMENT_STATUSES = {"planned", "running", "paused", "completed", "failed", "archived"}
+EXPERIMENT_TASK_STATUSES = {
+    "proposed",
+    "ready",
+    "leased",
+    "running",
+    "succeeded",
+    "failed",
+    "blocked",
+    "cancelled",
+}
+EXPERIMENT_TASK_TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "cancelled"}
 RESEARCH_STATUSES = {"planned", "running", "paused", "completed", "failed", "archived"}
 RESEARCH_SOURCE_STATUSES = {"candidate", "kept", "rejected", "stale"}
 RESEARCH_CLAIM_STATUSES = {"supported", "contradicted", "uncertain"}
@@ -2149,6 +2563,14 @@ def _validate_experiment_status(status: str) -> str:
     if status not in EXPERIMENT_STATUSES:
         raise ValueError(
             f"invalid experiment status {status!r}; choose one of {sorted(EXPERIMENT_STATUSES)}"
+        )
+    return status
+
+
+def _validate_experiment_task_status(status: str) -> str:
+    if status not in EXPERIMENT_TASK_STATUSES:
+        raise ValueError(
+            f"invalid experiment task status {status!r}; choose one of {sorted(EXPERIMENT_TASK_STATUSES)}"
         )
     return status
 
