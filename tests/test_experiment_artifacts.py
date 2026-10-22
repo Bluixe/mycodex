@@ -361,6 +361,48 @@ class ExperimentArtifactTests(unittest.TestCase):
             probe.assert_called_once_with(456, 0)
             self.assertEqual(json.loads((root / "receipt.json").read_text()), previous)
 
+    def test_exited_child_waits_for_durable_terminal_receipt_without_duplicate_spawn(self):
+        # A supervisor can reap its child before atomically saving the terminal
+        # receipt. A retry during that window must still refuse the ambiguity.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".mycodex/executions/owned"; root.mkdir(parents=True)
+            receipt_path = root / "receipt.json"
+            running = {"execution_id": "owned", "manifest_sha256": "hash", "status": "running",
+                       "pid": 123, "pid_start_ticks": "43", "supervisor_pid": 456,
+                       "supervisor_start_ticks": "42", "remote_commit": "abc",
+                       "log_path": "run.log", "pid_path": "run.pid"}
+            receipt_path.write_text(json.dumps(running))
+            encoded = base64.b64encode(json.dumps({"workdir": tmp, "execution_id": "owned",
+                                                  "manifest_sha256": "hash"}).encode()).decode()
+            original_read = Path.read_text
+
+            def read_receipt_or_supervisor_stat(path, *args, **kwargs):
+                if path == Path("/proc/456/stat"):
+                    return "456 (supervisor) S " + "0 " * 18 + "42"
+                return original_read(path, *args, **kwargs)
+
+            with patch("sys.argv", ["bootstrap", encoded]), patch("subprocess.Popen") as child, \
+                    patch("os.kill", side_effect=[None, ProcessLookupError]) as probe, \
+                    patch.object(Path, "read_text", autospec=True, side_effect=read_receipt_or_supervisor_stat), \
+                    self.assertRaisesRegex(RuntimeError, "receipt says running but original process is absent"):
+                exec(compile(REMOTE_BOOTSTRAP_SOURCE, "remote-bootstrap", "exec"), {})
+            child.assert_not_called()
+            self.assertEqual([call.args for call in probe.call_args_list], [(456, 0), (123, 0)])
+            self.assertEqual(json.loads(receipt_path.read_text()), running)
+
+            # Only the original supervisor's durable terminal state resolves the
+            # ambiguity; the retry then returns the receipt without any spawn.
+            completed = {**running, "status": "completed", "exit_code": 0}
+            receipt_path.write_text(json.dumps(completed))
+            with patch("sys.argv", ["bootstrap", encoded]), patch("subprocess.Popen") as child, \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                exec(compile(REMOTE_BOOTSTRAP_SOURCE, "remote-bootstrap", "exec"), {})
+            child.assert_not_called()
+            self.assertIn("REMOTE_REUSED=1", output.getvalue())
+            self.assertIn("REMOTE_EXECUTION_STATUS=completed", output.getvalue())
+            self.assertEqual(json.loads(receipt_path.read_text()), completed)
+            self.assertEqual(list(root.iterdir()), [receipt_path])
+
 
 class ProtocolLeaseTests(unittest.TestCase):
     def setUp(self):
@@ -552,14 +594,21 @@ class RemoteSupervisorIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             payload = self.prepare(root, "echo launched >> count; sleep 0.4")
-            first = self.run_payload(payload)
-            self.assertEqual(first.returncode, 0, first.stderr)
-            # Discard the response as if the SSH connection was lost; retry the same id.
-            time.sleep(0.6)
-            second = self.run_payload(payload)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertIn("REMOTE_REUSED=1", second.stdout)
-            self.assertEqual((root / "count").read_text().splitlines(), ["launched"])
+            try:
+                first = self.run_payload(payload)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                # Discard the response as if the SSH connection was lost. Child
+                # exit and receipt persistence are separate events, so observe
+                # the durable terminal receipt instead of assuming a sleep is
+                # long enough for the supervisor to finish its wait/save cycle.
+                receipt = self.wait_receipt(root, {"completed"})
+                self.assertEqual(receipt["exit_code"], 0)
+                second = self.run_payload(payload)
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertIn("REMOTE_REUSED=1", second.stdout)
+                self.assertEqual((root / "count").read_text().splitlines(), ["launched"])
+            finally:
+                self.cleanup_owned(root)
 
     def test_numeric_budget_terminates_and_failed_receipt_blocks_relaunch(self):
         with tempfile.TemporaryDirectory() as tmp:

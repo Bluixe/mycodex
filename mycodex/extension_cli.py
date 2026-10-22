@@ -99,6 +99,7 @@ def register_commands(sub) -> None:
     benchmarks = sub.add_parser('benchmarks', help='Compare isolated versions on sourced operational cases; no model calls by default')
     benchmarks.add_argument('--output', required=True)
     benchmarks.add_argument('--ref', action='append')
+    benchmarks.add_argument('--gate-ref', help='Fail unless this revision has a nonempty fully passing case set')
     benchmarks.add_argument('--live-material-pair', action='store_true', help='Explicitly run two read-only model tasks (30000 observed-token budget each)')
     benchmarks.set_defaults(handler=cmd_benchmarks, no_store=True)
 
@@ -238,8 +239,12 @@ def cmd_traces(store, args):
 
 
 def cmd_benchmarks(_store, args):
-    from .benchmarks import run_benchmarks, run_live_material_pair, DEFAULT_REFS
+    from .benchmarks import run_benchmarks, run_live_material_pair, gate_report, DEFAULT_REFS
     result = run_benchmarks(Path(__file__).resolve().parents[1], args.output, refs=args.ref or DEFAULT_REFS)
     if args.live_material_pair:
         result['live_material'] = run_live_material_pair(args.output)
+    if args.gate_ref:
+        result['gate'] = gate_report(result, args.gate_ref)
     emit(result)
+    if args.gate_ref and not result['gate']['passed']:
+        raise ValueError('benchmark gate failed: ' + result['gate']['reason'])

@@ -79,6 +79,7 @@ token savings and avoided losses remain unknown.
 ```text
 mycodex benchmarks --output data/benchmark-new
 mycodex benchmarks --output data/benchmark-three --ref ed16415 --ref a4eb8d0 --ref working-tree
+mycodex benchmarks --output data/benchmark-gated --gate-ref working-tree
 mycodex benchmarks --output data/benchmark-live --live-material-pair
 ```
 
@@ -87,6 +88,9 @@ an isolated import environment and runs the same sourced operational cases.
 Missing capabilities/refs are reported separately from passes. Case provenance,
 source tree hashes, timings and available metrics accompany the report. The local
 `a4eb8d0` reference is optional; a fresh clone may not contain it.
+`--gate-ref` requires a nonempty, fully passing target revision and returns a
+failure exit code for failed, unknown, missing or unsupported cases. CI gates the
+working tree while keeping older-version failures available for comparison.
 
 `--live-material-pair` explicitly runs two real read-only tasks with identical
 questions and a public-domain SQLite documentation gold set. Each uses an observed

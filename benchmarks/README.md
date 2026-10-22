@@ -52,6 +52,22 @@ improvement in general research quality from one pair of turns.
 
 ## Metrics
 
+Harness/behavior scorer version 2 distinguishes server completion from queue
+permission to continue. The `token-budget` case now runs the actual queue,
+service and native wait on identical constructed events (25 observed tokens,
+budget 20, followed by a real completed server event). It requires a non-success
+queue state and a blocked dependent task. The separate
+`completion-race-positive` case requires native transport to preserve a genuine
+server completion and its answer, while recording the interrupt request. A
+server can finish before interruption takes effect; suppressing that truth is
+not budget enforcement. Previous 12/13 reports are retained unchanged and are
+not comparable to the new 14-case denominator without this contract note.
+
+Add `--gate-ref working-tree` to either benchmark CLI to get a failing exit code
+when the selected revision is missing, unknown, empty, unsupported or has any
+failed/error case. Expected failures of another selected baseline do not fail
+this target-specific gate. The Python API is `gate_report(report, ref)`.
+
 Report actual adapter runtime and declared completion/error completion when
 observable. Constructed cases use zero live inference tokens and zero observed
 fixture interactions; expected production cost or human intervention is unknown.

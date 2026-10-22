@@ -29,6 +29,8 @@ from unittest.mock import patch
 
 PROVENANCE_TYPES = {'observed_historical_failure', 'constructed_from_incident', 'live_material_task'}
 DEFAULT_REFS = ('ed16415', 'working-tree')
+HARNESS_VERSION = 2
+BEHAVIOR_SCORER_VERSION = 2
 
 
 def _json(path: Path, value) -> None:
@@ -108,10 +110,66 @@ def _terminal(failed=False, budget=False):
         kwargs['usage_callback'] = lambda usage: usage.get('total', {}).get('totalTokens', 0) < 20
     result = client.wait_for_turn(**kwargs)
     completed = bool(result.completed)
-    passed = not completed and bool(interrupted) if budget else completed == (not failed)
-    return {'passed': passed, 'declared_completed': completed, 'erroneous_completion': completed and (failed or budget),
+    # In the completion race, native truth and permission to continue are two
+    # different contracts. The queue benchmark below checks the budget gate.
+    passed = completed and result.output_text == 'fixture output' if budget else completed == (not failed)
+    return {'passed': passed, 'declared_completed': completed, 'erroneous_completion': completed and failed,
             'observed_status': getattr(result, 'status', None), 'server_status': 'failed' if failed else 'completed',
             'interrupted': bool(interrupted), 'synthetic_usage_tokens': 25 if budget else None}
+
+
+def _queue_budget(root: Path) -> dict:
+    try:
+        from mycodex.jobs import JobQueue, run_worker
+    except ModuleNotFoundError:
+        return {'unsupported': 'version has no durable queue budget policy'}
+    from mycodex.codex_app import CodexAppServerClient
+    from mycodex.db import Store
+    interrupts = []
+    class FixtureRuntime(CodexAppServerClient):
+        def __init__(self):
+            super().__init__('unused-fixture-runtime')
+            self.interrupt_grace_seconds = 0.05
+            self._events.put({'method': 'item/completed', 'params': {'threadId': 'thread', 'turnId': 'turn',
+                'item': {'id': 'answer', 'type': 'agentMessage', 'phase': 'final_answer', 'text': 'fixture output'}}})
+            self._events.put({'method': 'thread/tokenUsage/updated', 'params': {'threadId': 'thread', 'turnId': 'turn',
+                'tokenUsage': {'total': {'totalTokens': 25}, 'last': {'totalTokens': 25}}}})
+            self._events.put({'method': 'turn/completed', 'params': {'threadId': 'thread',
+                'turn': {'id': 'turn', 'status': 'completed'}}})
+        def start(self):
+            pass
+        def close(self):
+            pass
+        def start_or_resume_thread(self, **kwargs):
+            return {'id': 'thread'}
+        def start_turn(self, **kwargs):
+            return 'turn', {'id': 'turn', 'status': 'inProgress'}
+        def read_latest_agent_message(self, *args):
+            return 'fixture output'
+        def interrupt_turn(self, **kwargs):
+            interrupts.append(kwargs)
+            return {}
+    with Store(root / 'budget.sqlite') as store:
+        store.add_project('benchmark', root)
+        queue = JobQueue(store)
+        job = queue.submit('benchmark', 'prompt', {'prompt': 'fixture bounded task', 'max_total_tokens': 20})
+        child = queue.submit('benchmark', 'prompt', {'prompt': 'must not continue over budget'}, depends_on=[job['id']])
+        with patch.dict(os.environ, {'MYCODEX_RUNTIME_BACKEND': 'app-server'}), \
+             patch('mycodex.service.CodexAppServerClient', return_value=FixtureRuntime()):
+            run_worker(store, once=True, job_id=job['id'])
+        observed = queue.get(job['id'])
+        queue.recover()
+        child_claim = queue.claim('dependency-check', job_id=child['id'])
+        native_runs = [dict(row) for row in store.list_runs(store.get_project('benchmark')['id'])]
+        tokens = (observed['result'].get('budget_usage') or {}).get('total_tokens')
+        passed = observed['status'] != 'succeeded' and child_claim is None and tokens == 25
+        return {'passed': passed, 'queue_status': observed['status'], 'dependency_status': queue.get(child['id'])['status'],
+                'dependency_continued': child_claim is not None, 'observed_tokens': tokens, 'declared_budget': 20,
+                'native_run_status': native_runs[0]['status'] if native_runs else None,
+                'native_result_status': observed['result'].get('status'), 'interrupt_requested': bool(interrupts),
+                'server_status': 'completed', 'declared_completed': observed['status'] == 'succeeded',
+                'erroneous_completion': observed['status'] == 'succeeded',
+                'scope': 'Actual queue + service + native wait; only stdio events are constructed. No inference or external job.'}
 
 
 class _CursorBarrier:
@@ -138,8 +196,10 @@ class _ConnectionBarrier:
 
 def _probe(case: dict, root: Path, material: dict) -> dict:
     kind = case['probe']
-    if kind in {'terminal_failed', 'terminal_success', 'token_budget'}:
-        return _terminal(failed=kind == 'terminal_failed', budget=kind == 'token_budget')
+    if kind == 'token_budget':
+        return _queue_budget(root)
+    if kind in {'terminal_failed', 'terminal_success', 'completion_race_positive'}:
+        return _terminal(failed=kind == 'terminal_failed', budget=kind == 'completion_race_positive')
     if kind == 'search_failure':
         from mycodex.research_connectors import search_public_sources
         kwargs = {'providers': ['arxiv'], 'limit': 1, 'timeout': 1}
@@ -305,7 +365,8 @@ def run_snapshot(target: Path, fixtures: Path, output: Path) -> dict:
         except Exception as exc:
             observed = {'error_type': type(exc).__name__, 'error': str(exc)}
             state = 'error'
-        rows.append({'case_id': case['id'], 'provenance': case['provenance'], 'state': state,
+        rows.append({'case_id': case['id'], 'contract_version': case.get('contract_version', 1),
+            'provenance': case['provenance'], 'state': state,
             'elapsed_seconds': time.perf_counter() - started, 'total_tokens': 0,
             'user_interventions': 0, 'inference_mode': 'none', 'observation': observed})
     imported = {name: getattr(module, '__file__', None) for name, module in sys.modules.items()
@@ -386,7 +447,8 @@ def run_benchmarks(repo_root: str | Path, output_dir: str | Path, *, refs=DEFAUL
             version = {**snapshot, **json.loads((run_dir / 'result.json').read_text(encoding='utf-8'))}
         versions.append(version)
     case_manifest = load_cases(fixtures)
-    report = {'schema_version': 1, 'created_at': datetime.now(timezone.utc).isoformat(),
+    report = {'schema_version': 1, 'harness_version': HARNESS_VERSION, 'behavior_scorer_version': BEHAVIOR_SCORER_VERSION,
+        'created_at': datetime.now(timezone.utc).isoformat(),
         'fixture_hash': _hash((fixtures / 'benchmarks' / 'cases.json').read_bytes()),
         'material_hash': _hash((fixtures / 'benchmarks' / 'materials' / 'sqlite.json').read_bytes()),
         'harness_hash': _hash(harness.read_bytes()),
@@ -407,6 +469,23 @@ def render_report(report: dict) -> str:
     lines += ['', 'Shared evaluable cases: ' + ', '.join(report['comparison']['shared_evaluable_cases']), '',
               '## Limits', '', *['- ' + item for item in report['comparison']['limitations']]]
     return '\n'.join(lines) + '\n'
+
+
+def gate_report(report: dict, ref: str = 'working-tree') -> dict:
+    """A target revision passes only with a nonempty, fully passing case set."""
+    versions = [row for row in report.get('versions', []) if row.get('ref') == ref]
+    if len(versions) != 1:
+        return {'passed': False, 'ref': ref, 'reason': 'target revision missing or ambiguous'}
+    target = versions[0]
+    if target.get('availability', 'available') != 'available':
+        return {'passed': False, 'ref': ref, 'reason': 'target revision unavailable',
+                'availability': target.get('availability')}
+    cases = target.get('cases') or []
+    counts = {state: sum(row.get('state') == state for row in cases)
+              for state in ('passed', 'failed', 'error', 'unsupported')}
+    passed = bool(cases) and all(row.get('state') == 'passed' for row in cases)
+    return {'passed': passed, 'ref': ref, 'case_count': len(cases), 'counts': counts,
+            'reason': 'all target cases passed' if passed else 'target has failed, unknown, unsupported or empty cases'}
 
 
 def score_material_answers(answer: dict, material: dict, context: dict) -> dict:
@@ -607,6 +686,7 @@ def main(argv=None):
     parser.add_argument('--probe', help=argparse.SUPPRESS)
     parser.add_argument('--fixtures', help=argparse.SUPPRESS)
     parser.add_argument('--live-material-pair', action='store_true', help='Opt in to two bounded real read-only model turns after fixture comparison')
+    parser.add_argument('--gate-ref', help='Fail unless this version has a nonempty fully passing case set')
     args = parser.parse_args(argv)
     if args.probe:
         run_snapshot(Path(args.probe), Path(args.fixtures), Path(args.output))
@@ -614,8 +694,12 @@ def main(argv=None):
         report = run_benchmarks(args.repo, args.output, refs=args.ref or DEFAULT_REFS)
         if args.live_material_pair:
             run_live_material_pair(args.output)
-        print(json.dumps(report['comparison'], ensure_ascii=False, indent=2))
+        result = report['comparison']
+        if args.gate_ref:
+            result['gate'] = gate_report(report, args.gate_ref)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if args.gate_ref and not result['gate']['passed'] else 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -7,7 +7,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from mycodex.benchmarks import compare_results, load_cases, run_benchmarks, run_live_material_pair, score_material_answers
+from mycodex.benchmarks import (_queue_budget, _terminal, compare_results, gate_report, load_cases,
+    run_benchmarks, run_live_material_pair, score_material_answers)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -107,6 +108,50 @@ class BenchmarkTests(unittest.TestCase):
             run_live_material_pair('unused-path', token_budget=30001)
         with self.assertRaises(ValueError):
             run_live_material_pair('unused-path', timeout=181)
+
+    def test_queue_budget_blocks_dependency_even_when_native_server_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = _queue_budget(Path(tmp))
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['native_run_status'], 'completed')
+        self.assertEqual(result['queue_status'], 'blocked')
+        self.assertFalse(result['dependency_continued'])
+        self.assertEqual(result['observed_tokens'], 25)
+
+    def test_native_completion_race_preserves_server_truth_separately(self):
+        result = _terminal(budget=True)
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['observed_status'], 'completed')
+        self.assertTrue(result['interrupted'])
+
+    def test_gate_requires_nonempty_all_passing_target_ignoring_old_failures(self):
+        good = {'ref': 'working-tree', 'cases': [{'state': 'passed'}]}
+        old = {'ref': 'baseline', 'cases': [{'state': 'failed'}]}
+        self.assertTrue(gate_report({'versions': [old, good]})['passed'])
+        for state in ('failed', 'error', 'unsupported', 'unknown'):
+            self.assertFalse(gate_report({'versions': [{'ref': 'working-tree', 'cases': [{'state': state}]}]})['passed'])
+        for target in ({'ref': 'working-tree', 'cases': []},
+                       {'ref': 'working-tree', 'availability': 'missing_ref', 'cases': [{'state': 'passed'}]}):
+            self.assertFalse(gate_report({'versions': [target]})['passed'])
+        self.assertFalse(gate_report({'versions': []})['passed'])
+
+    def test_module_gate_returns_nonzero_for_missing_target_without_inference(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, '-m', 'mycodex.benchmarks', '--output', str(Path(tmp)/'run'),
+                '--ref', 'intentionally-missing-benchmark-ref', '--gate-ref', 'working-tree'], cwd=ROOT, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'"passed": false', result.stdout)
+
+    def test_main_cli_gate_returns_nonzero_for_missing_target_without_inference(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, '-m', 'mycodex', 'benchmarks',
+                '--output', str(Path(tmp)/'run'), '--ref', 'intentionally-missing-benchmark-ref',
+                '--gate-ref', 'working-tree'], cwd=ROOT, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'benchmark gate failed', result.stderr)
+        self.assertIn(b'"passed": false', result.stdout)
 
 
 if __name__ == '__main__':
