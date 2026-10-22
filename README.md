@@ -126,6 +126,7 @@ mycodex traces --job-id 12 --output data/job-12-otlp.json
 mycodex traces --job-id 12 --output data/job-12-otlp.json --endpoint http://127.0.0.1:4318
 python -m mycodex.integration_checks --report-dir data/integration-check
 python -m mycodex.integration_checks --report-dir data/integration-sdk --sdk --sdk-probe
+MYCODEX_TEST_LOOPBACK_SSH=1 python -m unittest tests.test_ssh_integration -v
 ```
 
 Traces correlate job events and Codex attempts using OTLP/HTTP JSON. Exported
@@ -139,6 +140,10 @@ observers, concurrent retries, supervisor death and restart attempts inside
 temporary directories. Receipts require matching workload and supervisor
 identities; an orphan workload is `needs_reconciliation`, never silently restarted.
 The SDK probe creates and archives an empty real-runtime thread with no inference.
+The opt-in SSH test requires native Linux, OpenSSH server/client and passwordless
+sudo on an isolated test runner. It creates temporary keys/configuration and binds
+only 127.0.0.1 on a random high port; it never uses the owner's keys or changes a
+user account. Run it only in that test environment. CI has a dedicated bounded job.
 Live SSH, W&B and Telegram delivery still require their configured host/accounts.
 Experiment policy and protocol/recovery code now live in separate modules while
 the original imports remain compatible.
