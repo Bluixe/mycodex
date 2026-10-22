@@ -151,11 +151,15 @@ class CodexRuntimeTests(unittest.TestCase):
 
     def test_rpc_deadlines_clamp_setup_but_allow_bounded_cleanup(self):
         client = self.client()
-        client.operation_deadline = time.monotonic() + 0.1
-        self.assertLessEqual(client._rpc_timeout("thread/start", 90), 0.1)
-        client.operation_deadline = time.monotonic() - 1
-        self.assertEqual(client._rpc_timeout("turn/interrupt", 60), 5)
-        self.assertEqual(client._rpc_timeout("thread/archive", 60), 5)
+        # Deadline subtraction has floating-point rounding on coarse Windows
+        # clocks. Fix the clock and compare at nanosecond precision instead of
+        # requiring an exact binary representation of a decimal tenth.
+        with patch("mycodex.codex_app.time.monotonic", return_value=100.0):
+            client.operation_deadline = 100.1
+            self.assertAlmostEqual(client._rpc_timeout("thread/start", 90), 0.1, places=9)
+            client.operation_deadline = 99.0
+            self.assertEqual(client._rpc_timeout("turn/interrupt", 60), 5)
+            self.assertEqual(client._rpc_timeout("thread/archive", 60), 5)
 
     def test_incompatible_runtime_config_error_has_guidance_without_config_contents(self):
         client = self.client({"id": 1, "error": {"message":
