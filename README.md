@@ -8,7 +8,7 @@ The first version intentionally does not write Codex's internal automation table
 
 - Python 3.11+
 - Codex CLI installed and logged in
-- macOS/Linux shell environment
+- Windows, macOS, or Linux for the local manager; remote experiment runners use Linux/POSIX
 
 Check:
 
@@ -31,7 +31,336 @@ You can also run without installing:
 python3 -m mycodex --help
 ```
 
-## Core Commands
+## Conversation-backed project insights and user profile (0.4)
+
+The dashboard's **项目洞察** and **用户画像** pages read the conversations of
+explicitly selected registered projects. They show project goals, reported
+progress, blockers, next steps and an evidence-backed assessment, plus candidate
+work/communication preferences. Every factual item links to the cached source
+message and its time. An assistant's completion claim remains a report from the
+conversation, not independent proof that a server or experiment is healthy now.
+
+### Route selection
+
+| Route | Use | Tradeoff |
+| --- | --- | --- |
+| Native history API / local rollout index | Read source dialogue without resuming an original thread | API pagination and local log formats must be handled explicitly; cloud-only chats need an authorized source connector or export |
+| Entire history in each prompt | Useful for a small one-off conversation | A 134 MB local rollout is unsuitable for repeated full-context analysis |
+| Bounded recent evidence plus versioned derived reports | Implemented first stage | Reports expose partial windows; they do not claim exhaustive historical recall |
+| Semantic/graph retrieval across older episodes | Possible extension when older cross-session recall is needed | Requires retrieval evaluation and additional indexing; not implied by this release |
+
+The source layer incrementally caches bounded user/assistant messages from
+registered session logs in the application's SQLite database. It strips injected
+environment/system/memory blocks, tool payloads and reasoning, redacts recognizable
+credentials, and checks source thread identity/project context. Source log files
+are read-only. Receipts expose unavailable, skipped, migrated and truncated data,
+the available time window, and message counts. Unknown timestamps remain unknown.
+
+On explicit refresh, two isolated read-only model tasks analyze the recent
+project evidence and user-authored preferences, respectively. They use the existing
+Codex login/runtime, a temporary analysis directory, strict JSON schemas, bounded
+time/tokens, and are archived afterwards. Original project conversations are not
+resumed. Analysis-specific shell/search/app restrictions are requested through
+per-thread configuration, and tool activity interrupts analysis. A real empty-thread
+probe confirmed read-only, no network, and approval denial; the runtime did not
+return a full effective tool/MCP list. Source dialogue is data, never authorization
+for an action.
+Opening or reloading a page never triggers inference.
+
+Derived reports are versioned and retain their source references. A failed refresh
+retains the last successful report with an explicit stale/error state. Identical
+source fingerprints reuse cached analysis. Opening a report only checks indexed source file metadata; changed or unavailable sources are flagged while the original report time and coverage remain visible. Profile items start as candidates;
+confirmations/corrections survive regeneration. Rejecting or forgetting an item
+blocks its automatic reintroduction by key. Forgetting removes the derived item
+text/references from local profile versions while keeping a suppression hash;
+it does not delete the original conversation. Project-specific requests stay
+scoped to that project. Each candidate separates the model's concise interpretation
+from a literal user quotation and its evidence type. Quote matching establishes
+provenance; the interpretation remains a candidate until reviewed. The profile concerns stated goals, interests and working
+preferences; it does not infer sensitive traits or personality/health diagnoses.
+
+```text
+mycodex insights refresh --project tc --project htmlgame --enqueue
+mycodex insights refresh --extractive-only
+mycodex insights show --project tc
+mycodex profile show
+mycodex profile correct 12 --text "Prefer a brief explanation followed by the working local page."
+mycodex profile forget 12
+```
+
+An unqualified refresh selects registered projects except the control project's
+`mycodex` entry. The durable worker processes the request. The default aggregate
+bound is 120,000 observed tokens and 360 seconds across both model tasks; actual
+usage and unknown usage are reported separately. Event-based token interruption
+is not a provider billing cap. Recent evidence is bounded to 12,000 characters
+per project and the user-only profile input to 24,000 characters overall. No
+scheduled refresh is enabled by this feature.
+
+Design references: the [official app-server history API](https://learn.chatgpt.com/docs/app-server)
+provides non-resuming, paginated reads; [LongMemEval](https://arxiv.org/abs/2410.10813)
+motivates temporal updates, source retrieval and abstention; [Mem0](https://arxiv.org/abs/2504.19413)
+describes extracting and consolidating persistent conversational information.
+These papers inform the design; their benchmark scores are not results for this app.
+
+## Follow-up iteration (0.3)
+
+All ordinary CLI sends and summaries now save a durable job before execution.
+Without `--enqueue` the CLI consumes that saved job immediately; if another task
+owns its resource it stays queued. `--enqueue` saves only. `--no-sync` is retained
+as a compatibility flag: queued jobs use the session index frozen at submission.
+
+### Pause, edit, and resume
+
+```text
+mycodex jobs pause 12
+mycodex jobs show 12
+mycodex jobs revise 12 --revision 1 --prompt "Inspect the latest source passages before proposing an experiment."
+mycodex jobs resume 12
+```
+
+The `/jobs` page exposes these controls and the goal revision. A running Codex turn
+must confirm its terminal interruption before it becomes resumable. An interrupt
+acknowledgement alone leaves ambiguous work blocked for reconciliation. A queued
+task can pause immediately. Resume preserves its conversation, permissions and
+remaining observed-token/time budget; unknown prior token usage prevents resuming
+a token-limited task. An edit requires the current revision, so stale browser tabs
+cannot overwrite newer goals. Review inputs remain immutable. Active remote
+experiment operations cannot be paused by this local control.
+
+### Selective review and actual cost
+
+```text
+mycodex reviews --project NAME --risk evidence-conflict --token-budget 12000 --prompt "Check these passages and proposed conclusions."
+mycodex reviews --project NAME --policy auto --prompt "Summarize the saved state."
+mycodex review-report 1
+mycodex review-report 1 --assessment-file assessment.json
+```
+
+Explicit risk flags select evidence, implementation or experiment reviewers; a
+routine task with no declared risk skips additional model calls. Explicit `--role`
+still works. Reports contain routing reasons, actual reported tokens, elapsed time
+and owner-verified findings. An assessment JSON contains `verifier`, `notes`, and
+`findings`; each finding needs `review_job_id`, `summary`, `disposition`
+(`accepted`, `rejected`, or `unresolved`) and inspectable `evidence`. Assessments
+are write-once. Agreement is not verification, and no paired baseline means net
+token savings and avoided losses remain unknown.
+
+### Sourced operational and material benchmarks
+
+```text
+mycodex benchmarks --output data/benchmark-new
+mycodex benchmarks --output data/benchmark-three --ref ed16415 --ref a4eb8d0 --ref working-tree
+mycodex benchmarks --output data/benchmark-gated --gate-ref working-tree
+mycodex benchmarks --output data/benchmark-live --live-material-pair
+```
+
+The default performs zero model calls. It archives each selected Git version into
+an isolated import environment and runs the same sourced operational cases.
+Missing capabilities/refs are reported separately from passes. Case provenance,
+source tree hashes, timings and available metrics accompany the report. The local
+`a4eb8d0` reference is optional; a fresh clone may not contain it.
+`--gate-ref` requires a nonempty, fully passing target revision and returns a
+failure exit code for failed, unknown, missing or unsupported cases. CI gates the
+working tree while keeping older-version failures available for comparison.
+
+`--live-material-pair` explicitly runs two real read-only tasks with identical
+questions and a public-domain SQLite documentation gold set. Each uses an observed
+30000-token budget and a 180-second timeout; input or in-flight tokens can overshoot
+an event-based limit. Probe threads are archived. This small recency-stress task
+measures source retrieval and visible citation support, not general research
+quality or a statistically established model improvement. Full provenance and
+scoring limits are in [benchmarks/README.md](benchmarks/README.md).
+
+### Structured PDFs and optional runtime transport
+
+Install optional capabilities into the project environment:
+
+```text
+python -m pip install -e ".[dev,documents,sdk]" -c requirements-dev.lock
+```
+
+PDF ingestion can use `pdfplumber` in a timeout-bounded child process. It preserves
+physical page numbers, character offsets and bounding boxes for actual extracted
+passages, headings, figure/table captions, detected table regions and explicitly
+numbered formula candidates. Missing glyphs and incomplete extraction remain
+visible. Formula recognition does not recover LaTeX or validate mathematics, and
+table detection does not verify cell values. `pdftotext` remains a fallback.
+GROBID is an explicit optional service adapter; it sends a PDF only when its URL
+is supplied, and an unavailable service is recorded as unavailable.
+
+The `sdk` extra pins the tested official Python SDK. Set
+`MYCODEX_RUNTIME_BACKEND=sdk` to use its transport through the same lifecycle,
+contract, usage and interruption checks. The default remains `app-server`. The
+adapter explicitly declines approval requests, applies RPC deadlines, and refuses
+untested SDK versions rather than silently falling back.
+
+### Trace export and integration checks
+
+```text
+mycodex traces --job-id 12 --output data/job-12-otlp.json
+mycodex traces --job-id 12 --output data/job-12-otlp.json --endpoint http://127.0.0.1:4318
+python -m mycodex.integration_checks --report-dir data/integration-check
+python -m mycodex.integration_checks --report-dir data/integration-sdk --sdk --sdk-probe
+MYCODEX_TEST_LOOPBACK_SSH=1 python -m unittest tests.test_ssh_integration -v
+```
+
+Traces correlate job events and Codex attempts using OTLP/HTTP JSON. Exported
+attributes omit prompts, outputs, source text, file paths and credentials. A
+collector POST happens only with an explicit endpoint. Its acknowledgement is
+transport evidence, not proof of backend persistence. Wire format follows the
+[OTLP specification](https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding).
+
+Integration reports list every pass/failure/skip. Native Linux tests inject lost
+observers, concurrent retries, supervisor death and restart attempts inside
+temporary directories. Receipts require matching workload and supervisor
+identities; an orphan workload is `needs_reconciliation`, never silently restarted.
+The SDK probe creates and archives an empty real-runtime thread with no inference.
+The opt-in SSH test requires native Linux, OpenSSH server/client and passwordless
+sudo on an isolated test runner. It creates temporary keys/configuration and binds
+only 127.0.0.1 on a random high port; it never uses the owner's keys or changes a
+user account. Run it only in that test environment. CI has a dedicated bounded job.
+Live SSH, W&B and Telegram delivery still require their configured host/accounts.
+Experiment policy and protocol/recovery code now live in separate modules while
+the original imports remain compatible.
+
+## Reliability and research iteration (0.2 foundation)
+
+This iteration keeps SQLite as the control plane and adds a persistent job queue,
+versioned research evidence, bounded remote execution, and recorded-run checks.
+The CLI command names remain available; version 0.3 makes durable execution the default.
+The web and Telegram prompt entrances save jobs before execution. The daemon queues
+scheduled prompts/summaries and owns a separate local queue consumer.
+
+Set up an isolated environment (on Windows use `.venv\Scripts\python.exe` and
+`.venv\Scripts\mycodex.exe`; on macOS/Linux use `.venv/bin/python`):
+
+```text
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev]" -c requirements-dev.lock
+.venv\Scripts\python.exe -m mycodex doctor
+.venv\Scripts\python.exe -m unittest discover -v
+```
+
+On macOS/Linux substitute `.venv/bin/python` for the Windows environment path. The lock file
+pins the tested development dependencies; W&B remains an optional install.
+
+### Durable jobs and bounded reviews
+
+```text
+mycodex send --project NAME --enqueue --max-total-tokens 8000 "Read the current evidence and propose the next diagnostic."
+mycodex worker --once
+mycodex worker
+mycodex jobs list --project NAME
+mycodex jobs show 12
+mycodex jobs cancel 12
+mycodex jobs recover
+mycodex reviews --project NAME --role evidence --role experiment --token-budget 12000 --prompt "Review this plan and its supplied evidence."
+```
+
+Jobs freeze thread and permission defaults on submission. Atomic leases prevent
+two consumers claiming the same task; dependencies prevent synthesis before its
+reviews finish. Independent read-only review threads can run concurrently using
+multiple worker processes. Existing shared threads and writable project tasks
+are serialized. Review outputs are proposals and cannot themselves authorize execution.
+
+Expired **unstarted** leases return to the queue. Expired **running** leases become
+blocked because work may already have happened; inspect run/remote evidence before
+submitting a replacement. Cancellation interrupts a live queued Codex turn through
+the owning worker. It does not kill unrelated processes or already launched remote
+training. Token limits are checked on reported usage and can overshoot by an in-flight
+model call; timeouts bound the local turn. No currency/billing estimate is invented.
+
+### Evidence and research coverage
+
+```text
+mycodex evidence index --project NAME --name RESEARCH --source-id 1 --file paper.pdf
+mycodex evidence search --project NAME --name RESEARCH --query "policy adaptation"
+mycodex evidence versions --project NAME --name RESEARCH --source-id 1
+mycodex evidence link --project NAME --name RESEARCH --claim-id 2 --passage-id 3 --relation supports --verification-status verified --verifier human-review --notes "The passage states the measured condition and its limitation."
+```
+
+Search records per-provider coverage, cache hashes and failures. Empty results
+are distinct from unavailable providers. `OPENALEX_API_KEY` and
+`SEMANTIC_SCHOLAR_API_KEY` are environment variables, never stored credentials.
+Source versions and passage text are immutable; locators are only as precise as
+the extractor supports. Missing page/section values remain unknown. Retrieval is
+lexical, including Chinese bigrams; no embedding service is required.
+
+Local templates produce uncertain hypotheses. An explicit evidence link with a
+passage, verifier and justification is required for autonomous claim promotion;
+this is a traceable verification record, not proof that a scientific claim is true.
+Empty PDF extraction cannot improve reading depth. Manual legacy labels remain
+visible as `legacy_unverified`. Source text and reviewer text are untrusted data.
+
+### Remote execution identity and artifacts
+
+```text
+mycodex experiments launch-remote --project NAME --name EXPERIMENT --execution-id diagnostic-001 --time-budget-seconds 600 --command "python scripts/diagnostic.py"
+mycodex artifacts list --project NAME --name EXPERIMENT
+mycodex artifacts result --project NAME --name EXPERIMENT --execution-id diagnostic-001 --result-file result.json
+```
+
+Remote launches use an atomic claim and durable receipt under a stable execution
+identity. A retry with that identity observes the existing job; an intentional rerun
+uses a new identity. Numeric time budgets are enforced by the remote supervisor
+with termination/grace/kill behavior. Legacy prose budgets are explicitly marked
+unbounded; schema-v1 execution contracts require an enforceable numeric duration.
+The experiment `config_json.execution_policy` may restrict remote targets, command
+hashes, local-check hashes, patch roots, execution classes, destructive operations
+and runtime budgets. This policy is not an operating-system sandbox. Local checks
+have a default 300-second per-check limit, capped by policy when configured.
+
+Local manifests live beside the selected DB under `experiment_artifacts/` and
+record the resolved code commit, command/config hashes, budget and supplied research
+metadata. Result gates distinguish triage from method-claim evidence and validate
+recorded receipts plus referenced local artifact hashes. Unknown seed/dataset fields
+remain unknown. Native remote supervisor integration tests run on Linux; a Windows
+local manager requires a compatible remote Linux environment.
+
+### MCP, task decisions, and evaluation
+
+```text
+mycodex web
+mycodex mcp
+mycodex mcp --allow-writes
+mycodex evals --project NAME
+mycodex evals --input exported-runs.json
+```
+
+`/jobs` explains active work, blockers, limits and observed consumption, and supports
+saved-task cancellation. Research evidence/coverage is accessible from this view.
+The STDIO MCP server exposes project state, jobs, source passages and experiment
+manifests. It is read-only by default. `--allow-writes` adds bounded job submission
+and cancellation; MCP submissions cannot enlarge project permissions. Start the
+server with the absolute environment Python, `-m mycodex --db ABSOLUTE_DB mcp`,
+in your MCP client's configuration. No client settings are changed by installation.
+
+`evals` runs deterministic consistency/evidence/budget checks over recorded or exported
+runs; it exits unsuccessfully when checks fail. It is not a live scientific-quality
+benchmark. Runtime traces preserve model events, native usage and job correlation.
+Native JSON output schemas use the supported strict subset and normalize into
+versioned control contracts, then undergo separate type and policy checks. The
+native app-server transport remains the default; version 0.3 adds an optional SDK
+transport and explicit OTLP trace export. Embedding retrieval is not implemented.
+
+Executable selection is: explicit client argument, `MYCODEX_CODEX_BIN`, an existing
+host-provided `CODEX_CLI_PATH`, then PATH. This avoids accidentally choosing an old
+global CLI that cannot parse a newer desktop configuration. It never rewrites the
+global service tier or other user settings. `doctor` shows the selected executable.
+
+Development validation includes a local handshake and one real read-only native-v1
+structured-output turn using the host runtime; the temporary probe thread was
+archived afterward. Live SSH/W&B/Telegram and Linux supervisor execution require a
+configured remote host/account and remain separate integration checks. The shared
+remote checkout refuses a distinct active or ambiguous managed execution before
+fetch/checkout; unmanaged legacy jobs and deliberately detached child groups still
+require an external controller or manual reconciliation.
+Experiment protocol tasks renew their own leases and fence start/completion by a
+unique acquisition token. Repeated contract recording cannot replace an active
+lease. Only a failed read-only monitor command can derive a new retry task, up to
+three total attempts with persisted lineage; prior terminal tasks remain unchanged.
+
+## Core command reference
 
 Add a project:
 

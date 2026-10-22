@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     try:
+        if getattr(args, "no_store", False):
+            args.handler(None, args)
+            return 0
         with Store(args.db) as store:
             args.handler(store, args)
         return 0
@@ -146,12 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--approval-policy", choices=sorted(["untrusted", "on-failure", "on-request", "never"]))
     send.add_argument("--model")
     send.add_argument("--effort", dest="reasoning_effort")
+    send.add_argument("--enqueue", action="store_true", help="Save only; otherwise consume this durable task immediately")
+    send.add_argument("--max-total-tokens", type=int, help="Stop a queued Codex turn when usage reaches this limit")
     send.set_defaults(handler=cmd_send)
 
     daily = sub.add_parser("daily-summary", help="Generate a daily summary for a project")
     daily.add_argument("--project", required=True)
     daily.add_argument("--timeout", type=int, default=1800)
     daily.add_argument("--no-sync", action="store_true")
+    daily.add_argument("--enqueue", action="store_true")
     daily.set_defaults(handler=cmd_daily_summary)
 
     daemon = sub.add_parser("daemon", help="Run local scheduled rules")
@@ -396,6 +402,9 @@ def build_parser() -> argparse.ArgumentParser:
     exp_launch.add_argument("--post-launch-check-lines", type=int, default=80)
     exp_launch.add_argument("--no-post-launch-check", action="store_true")
     exp_launch.add_argument("--dry-run", action="store_true")
+    exp_launch.add_argument("--execution-id", help="Stable identity; use a fresh id for an intentional rerun")
+    exp_launch.add_argument("--time-budget-seconds", type=int, help="Hard remote runtime limit")
+    exp_launch.add_argument("--termination-grace-seconds", type=int, default=30)
     exp_launch.set_defaults(handler=cmd_experiments_launch_remote)
 
     exp_remote_status = experiments_sub.add_parser("remote-status", help="Check remote PID and recent log tail")
@@ -696,6 +705,9 @@ def build_parser() -> argparse.ArgumentParser:
     research_task_add.add_argument("--result-json", default="{}")
     research_task_add.set_defaults(handler=cmd_research_task_add)
 
+    from .extension_cli import register_commands
+
+    register_commands(sub)
     return parser
 
 
@@ -878,35 +890,22 @@ def cmd_sessions_set_default(store: Store, args) -> None:
 
 def cmd_send(store: Store, args) -> None:
     prompt = " ".join(args.prompt)
-    result = send_prompt(
-        store,
-        args.project,
-        prompt,
-        new_thread=args.new_thread,
-        timeout=args.timeout,
-        sync_first=not args.no_sync,
-        sandbox=args.sandbox,
-        approval_policy=args.approval_policy,
-        model=args.model,
-        reasoning_effort=args.reasoning_effort,
-    )
-    print(f"Run #{result['run_id']} {result['status']} thread={result['thread_id']}")
-    if result["output_text"]:
-        print()
-        print(result["output_text"])
+    from .jobs import JobQueue, run_worker
+    payload = {"prompt": prompt, "new_thread": args.new_thread, "timeout": args.timeout,
+               "max_total_tokens": args.max_total_tokens}
+    payload.update({key: getattr(args, key) for key in ("sandbox", "approval_policy", "model", "reasoning_effort") if getattr(args, key) is not None})
+    job = JobQueue(store).submit(args.project, "prompt", payload)
+    if not args.enqueue:
+        run_worker(store, once=True, job_id=job['id'])
+    print(json.dumps(JobQueue(store).get(job['id']), ensure_ascii=False, default=str))
 
 
 def cmd_daily_summary(store: Store, args) -> None:
-    result = run_daily_summary(
-        store,
-        args.project,
-        timeout=args.timeout,
-        sync_first=not args.no_sync,
-    )
-    print(f"Run #{result['run_id']} {result['status']} thread={result['thread_id']}")
-    if result["output_text"]:
-        print()
-        print(result["output_text"])
+    from .jobs import JobQueue, run_worker
+    job = JobQueue(store).submit(args.project, "daily_summary", {"timeout": args.timeout})
+    if not args.enqueue:
+        run_worker(store, once=True, job_id=job['id'])
+    print(json.dumps(JobQueue(store).get(job['id']), ensure_ascii=False, default=str))
 
 
 def cmd_daemon(store: Store, args) -> None:
@@ -1439,6 +1438,9 @@ def cmd_experiments_launch_remote(store: Store, args) -> None:
         dry_run=args.dry_run,
         post_launch_check_delay=-1 if args.no_post_launch_check else args.post_launch_check_delay,
         post_launch_check_lines=args.post_launch_check_lines,
+        execution_id=args.execution_id,
+        time_budget_seconds=args.time_budget_seconds,
+        termination_grace_seconds=args.termination_grace_seconds,
     )
     if result.get("dry_run"):
         print("Remote launch dry run.")
@@ -1726,7 +1728,7 @@ def cmd_research_status(store: Store, args) -> None:
     events = store.list_research_events(research["id"], limit=args.limit)
 
     _print_research_rows("Sources", sources, lambda row: f"#{row['id']} {row['status']} {row['role']} {row['title']} {row['url']}")
-    _print_research_rows("Claims", claims, lambda row: f"#{row['id']} {row['status']} c={row['confidence']} {row['claim']}")
+    _print_research_rows("Claims", claims, lambda row: f"#{row['id']} {row['status']} verification={json.loads(row['metadata_json'] or '{}').get('verification_status', 'legacy_unverified')} c={row['confidence']} {row['claim']}")
     _print_research_rows("Ideas", ideas, lambda row: f"#{row['id']} {row['status']} {row['title']} :: {row['minimal_test']}")
     _print_research_rows("Tasks", tasks, lambda row: f"#{row['id']} {row['status']} {row['task_type']} {row['title'] or row['query']}")
     _print_research_rows(
@@ -1918,7 +1920,7 @@ def cmd_research_claim_add(store: Store, args) -> None:
     claim_id = store.add_research_claim(
         research["id"],
         claim=args.claim,
-        status=args.status,
+        status="uncertain" if args.status in {"supported", "contradicted"} else args.status,
         support=args.support,
         confidence=args.confidence,
         notes=args.notes,
@@ -1933,6 +1935,8 @@ def cmd_research_claim_add(store: Store, args) -> None:
     )
     path = write_research_markdown(store, args.project, args.name)
     print(f"Research claim #{claim_id} saved.")
+    if args.status in {"supported", "contradicted"}:
+        print("Verification pending: use evidence link with an indexed passage and verification notes.")
     print(f"Markdown: {path}")
 
 

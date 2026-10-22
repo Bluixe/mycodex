@@ -1,0 +1,72 @@
+name: checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev,documents]" -c requirements-dev.lock
+      - run: python -m compileall -q mycodex tests
+      - run: python -W error::ResourceWarning -m unittest discover -v > unittest.log 2>&1
+      - name: Show failing test summary
+        if: failure()
+        run: python -c "from pathlib import Path; p=Path('unittest.log'); print(p.read_text(encoding='utf-8', errors='replace')[-16000:] if p.exists() else 'No test log was produced')"
+      - if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        run: python -m mycodex.benchmarks --output data/ci-benchmark --gate-ref working-tree
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tests-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            unittest.log
+            data/ci-benchmark/report.json
+  sdk-transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e ".[dev,sdk]" -c requirements-dev.lock
+      - run: python -W error::ResourceWarning -m unittest tests.test_runtime_adapters tests.test_sdk_transport_integration -v
+  loopback-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -e ".[dev]" -c requirements-dev.lock
+      - name: Prepare temporary-runner SSH prerequisites
+        run: |
+          if ! test -x /usr/sbin/sshd; then
+            sudo apt-get update
+            sudo apt-get install -y openssh-server
+          fi
+          sudo mkdir -p /run/sshd
+      - name: Test bounded loopback SSH recovery
+        env:
+          MYCODEX_TEST_LOOPBACK_SSH: '1'
+        run: python -W error::ResourceWarning -m unittest tests.test_ssh_integration -v > ssh-integration.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loopback-ssh-log
+          path: ssh-integration.log

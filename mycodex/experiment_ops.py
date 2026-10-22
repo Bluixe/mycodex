@@ -8,14 +8,85 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
+import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .db import EXPERIMENT_TASK_TERMINAL_STATUSES, Store
+from .contracts import (
+    ContractValidationError, PEER_REVIEW_CONTRACT_V1,
+    parse_contract, validate_contract, validate_execution_contract,
+)
+from .experiment_artifacts import (
+    assess_result_evidence, build_execution_manifest, canonical_hash,
+    execution_policy_failures, patch_scope_failures, persist_execution_manifest,
+    persist_execution_result, read_execution_manifest, render_bounded_command, render_remote_launch_script,
+    resolve_time_budget, validate_execution_id, REMOTE_RECEIPT_OBSERVATION_SOURCE, receipt_observation_status,
+)
+from . import experiment_protocol as _protocol
+from .experiment_policy import (
+    DEFAULT_PEER_REVIEW_BYPASS_ALLOWED_CLASSES,
+    DEFAULT_PEER_REVIEW_BYPASS_ON,
+    EVAL_EXECUTION_CLASSES,
+    LOW_RISK_EXECUTION_CLASSES,
+    PEER_REVIEW_EXEMPT_EXECUTION_CLASSES,
+    PLACEHOLDER_WANDB_RUN_IDS,
+    REMOTE_COMMAND_EXECUTION_CLASSES,
+    RESEARCH_REQUIRED_DECISION_KEYS,
+    RESEARCH_REQUIRED_EXECUTION_CLASSES,
+    RESEARCH_REQUIRED_LIST_FIELDS,
+    RESEARCH_REQUIRED_SCALAR_FIELDS,
+    WANDB_PRODUCING_EXECUTION_CLASSES,
+    _JSON_BLOCK_RE,
+    extract_execution_contract,
+    _execution_contract_parse_failure,
+    extract_peer_review_decision,
+    _normalize_policy_tokens,
+    _peer_review_result_status,
+    _review_decision_text,
+    _peer_review_has_required_changes,
+    _execution_class,
+    _contract_skips_peer_review,
+    _phase_for_contract_execution,
+    _review_text,
+    _peer_review_hard_blockers,
+    _peer_review_soft_objections,
+    _annotate_contract_with_reviewer_objections,
+    _remote_eval_command_looks_destructive,
+    _contract_bypass_failures,
+    _validate_experiment_contract_types,
+    _has_contract_content,
+    _contract_research_failures,
+    _peer_review_blocked_since,
+    _assess_peer_review_bypass,
+    _contract_execution_failures,
+    _contract_summary,
+    _contract_produces_wandb_run,
+    _contract_monitors_wandb_run,
+    _is_real_wandb_run_id,
+    _contract_execution_fingerprint,
+    _event_payload,
+)
+from .experiment_protocol import (
+    _contract_task_idempotency_key,
+    _contract_protocol_readiness,
+    record_execution_contract_task,
+    _protocol_task_outcome,
+    _lease_recorded_protocol_task,
+    _record_protocol_lease_loss,
+    _complete_recorded_protocol_task,
+    recover_stale_experiment_tasks,
+    _task_has_remote_launch_event,
+    _payload_mentions_protocol_task,
+    _require_experiment,
+)
+
 from .service import (
     require_project,
     start_experiment_contract_repair_turn,
@@ -65,7 +136,6 @@ WandbFetcher = Callable[[WandbRunRef, list[str], int], dict[str, Any]]
 
 
 _REMOTE_REF_RE = re.compile(r"^(?P<login>[^:]+?)(?::(?P<port>\d+))?:(?P<path>/.*)$")
-_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 _COND_RE = re.compile(
     r"^\s*(?P<metric>[A-Za-z0-9_./:-]+)\s*"
     r"(?P<op>>=|<=|==|!=|>|<)\s*"
@@ -78,65 +148,11 @@ _REMOTE_FAILURE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-LOW_RISK_EXECUTION_CLASSES = {
-    "read-only-preflight",
-    "diagnostic-patch",
-    "smoke-eval",
-    "eval-only",
-    "smoke-train",
-    "monitor-only",
-}
-EVAL_EXECUTION_CLASSES = {"smoke-eval", "eval-only"}
-REMOTE_COMMAND_EXECUTION_CLASSES = {
-    "read-only-preflight",
-    "monitor-only",
-    "smoke-eval",
-    "eval-only",
-    "smoke-train",
-    "full-train",
-}
-PEER_REVIEW_EXEMPT_EXECUTION_CLASSES = EVAL_EXECUTION_CLASSES
 SAFE_FALLBACK_EXECUTION_CLASSES = {
     "read-only-preflight",
     "monitor-only",
     "smoke-eval",
     "eval-only",
-}
-DEFAULT_PEER_REVIEW_BYPASS_ON = {"revise", "timeout"}
-DEFAULT_PEER_REVIEW_BYPASS_ALLOWED_CLASSES = LOW_RISK_EXECUTION_CLASSES | {"full-train"}
-WANDB_PRODUCING_EXECUTION_CLASSES = {
-    "smoke-eval",
-    "eval-only",
-    "smoke-train",
-    "full-train",
-}
-RESEARCH_REQUIRED_EXECUTION_CLASSES = {
-    "smoke-train",
-    "full-train",
-}
-RESEARCH_REQUIRED_SCALAR_FIELDS = (
-    "hypothesis",
-    "mechanism",
-    "baseline",
-    "intervention",
-    "anti_sweep_rationale",
-)
-RESEARCH_REQUIRED_LIST_FIELDS = (
-    "falsifiable_predictions",
-    "controls",
-    "analysis_plan",
-)
-RESEARCH_REQUIRED_DECISION_KEYS = (
-    "supports",
-    "falsifies",
-    "ambiguous",
-)
-PLACEHOLDER_WANDB_RUN_IDS = {
-    "",
-    "discover_after_launch",
-    "discover_after_launch_by_run_name",
-    "pending",
-    "unknown",
 }
 MAX_CONTRACT_PARSE_REPAIR_ATTEMPTS = 2
 WATCHDOG_ACTIVITY_EVENTS = {
@@ -289,6 +305,11 @@ def git_commit_push(
                 phase="waiting_for_commit",
             )
             raise ValueError("refusing to commit without --all or --path")
+        if not all_changes:
+            staged_paths = set(_git_text(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0")) - {""}
+            unrelated_staged = sorted(staged_paths - set(selected_paths))
+            if unrelated_staged:
+                raise ValueError("refusing to commit unrelated staged files: " + ", ".join(unrelated_staged))
 
         store.add_experiment_event(
             experiment["id"],
@@ -372,6 +393,11 @@ def launch_remote_job(
     post_launch_check_delay: float = 2.0,
     post_launch_check_lines: int = 80,
     remote_runner: RemoteRunner | None = None,
+    execution_id: str | None = None,
+    execution_contract: dict[str, Any] | None = None,
+    protocol_task_id: int | None = None,
+    time_budget_seconds: float | None = None,
+    termination_grace_seconds: float = 30,
 ) -> dict[str, Any]:
     command = command.strip()
     if not command:
@@ -412,10 +438,36 @@ def launch_remote_job(
             )
             raise ValueError("local repository is dirty; commit and push before launching remote job")
 
-    launch_ts = int(time.time())
-    resolved_log_path = log_path or f"logs/mycodex/{experiment_name}-{launch_ts}.log"
-    resolved_pid_path = pid_path or f"{resolved_log_path}.pid"
     resolved_env = _validate_env(env or {})
+    contract = execution_contract or {"execution_class": "manual", "remote": {"command": command}, "wandb": {
+        "entity": wandb_entity, "project": wandb_project, "run_id": wandb_run_id, "run_name": wandb_run_name}}
+    policy = config.get("execution_policy", {})
+    if policy is None:
+        policy = {}
+    policy_contract = {**contract, "remote": {**(contract.get("remote") or {}), "command": command}}
+    if time_budget_seconds is not None:
+        policy_contract["remote"]["time_budget_seconds"] = time_budget_seconds
+    policy_failures = execution_policy_failures(policy_contract, policy)
+    if policy_failures:
+        raise ValueError("external execution policy refused launch: " + ", ".join(policy_failures))
+    if policy.get("allowed_remote_refs") is not None and target.ref not in policy["allowed_remote_refs"]:
+        raise ValueError("external execution policy refused remote target")
+    if time_budget_seconds is None:
+        time_budget_seconds = resolve_time_budget(policy_contract["remote"])
+    if not math.isfinite(float(termination_grace_seconds)) or termination_grace_seconds < 0:
+        raise ValueError("termination_grace_seconds must be finite and nonnegative")
+    identity = {"project_id": project["id"], "experiment_id": experiment["id"], "remote_ref": target.ref,
+                "commit": commit, "command": command, "env": resolved_env, "protocol_task_id": protocol_task_id,
+                "contract": contract, "budget": time_budget_seconds, "grace": termination_grace_seconds}
+    resolved_execution_id = validate_execution_id(execution_id or "exec-" + canonical_hash(identity)[:32])
+    resolved_log_path = log_path or f"logs/mycodex/{resolved_execution_id}.log"
+    resolved_pid_path = pid_path or f"{resolved_log_path}.pid"
+    manifest = build_execution_manifest(
+        execution_id=resolved_execution_id, project_id=project["id"], experiment_id=experiment["id"],
+        remote_ref=target.ref, commit=commit, command=command, env=resolved_env, contract=contract,
+        protocol_task_id=protocol_task_id, time_budget_seconds=time_budget_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        artifact_refs={"log_path": resolved_log_path, "pid_path": resolved_pid_path})
     script = _remote_launch_script(
         target=target,
         command=command,
@@ -425,6 +477,10 @@ def launch_remote_job(
         log_path=resolved_log_path,
         pid_path=resolved_pid_path,
         env=resolved_env,
+        execution_id=resolved_execution_id,
+        manifest=manifest,
+        time_budget_seconds=time_budget_seconds,
+        termination_grace_seconds=termination_grace_seconds,
     )
 
     payload_base = {
@@ -442,6 +498,11 @@ def launch_remote_job(
         "wandb_run_id": wandb_run_id,
         "wandb_run_name": wandb_run_name,
         "ssh_auth": "password_file" if resolved_ssh_password_file else ("key" if resolved_ssh_key else "default"),
+        "execution_id": resolved_execution_id,
+        "protocol_task_id": protocol_task_id,
+        "manifest_sha256": canonical_hash(manifest),
+        "time_budget_seconds": time_budget_seconds,
+        "budget_enforced": time_budget_seconds is not None,
     }
 
     if dry_run:
@@ -450,12 +511,19 @@ def launch_remote_job(
             event_type="remote_launch_dry_run",
             level="info",
             message=f"Would launch remote job on {target.ref}.",
-            payload={**payload_base, "script": script},
+            payload={**payload_base, "script_sha256": hashlib.sha256(script.encode()).hexdigest(), "manifest": manifest},
             source="mycodex",
             status="running",
             phase="waiting_for_experiment_start",
         )
-        return {**payload_base, "script": script, "dry_run": True}
+        return {**payload_base, "script": script, "manifest": manifest, "dry_run": True}
+
+    manifest_path = persist_execution_manifest(store.path.parent / "experiment_artifacts", manifest)
+    payload_base["manifest_path"] = str(manifest_path.resolve())
+    store.add_experiment_event(
+        experiment["id"], event_type="execution_manifest_saved", level="info",
+        message=f"Saved immutable execution manifest for {resolved_execution_id}.",
+        payload={**payload_base, "manifest": manifest}, source="mycodex")
 
     store.add_experiment_event(
         experiment["id"],
@@ -491,6 +559,31 @@ def launch_remote_job(
         raise
 
     parsed = _parse_key_values(result.stdout)
+    receipt: dict[str, Any] = {}
+    if result.returncode != 0:
+        raise RemoteCommandError("remote launcher returned a failure exit status", result)
+    receipt_verified = False
+    if parsed.get("REMOTE_RECEIPT"):
+        try:
+            receipt = json.loads(base64.b64decode(parsed["REMOTE_RECEIPT"]))
+            if not isinstance(receipt, dict):
+                raise ValueError("receipt must be an object")
+            receipt_verified = (receipt.get("execution_id") == resolved_execution_id
+                                and receipt.get("manifest_sha256") == canonical_hash(manifest)
+                                and receipt.get("status") in {"running", "completed"}
+                                and bool(receipt.get("pid"))
+                                and str(receipt.get("pid")) == parsed.get("REMOTE_PID")
+                                and (receipt.get("status") != "completed" or
+                                     (type(receipt.get("exit_code")) is int and receipt["exit_code"] == 0)))
+        except (ValueError, TypeError, KeyError):
+            receipt_verified = False
+    if not receipt_verified and (remote_runner is None or parsed.get("REMOTE_RECEIPT")):
+        store.add_experiment_event(
+            experiment["id"], event_type="remote_launch_receipt_invalid", level="error",
+            message="Remote launch receipt is missing, invalid, or failed; reconcile before retry.",
+            payload={**payload_base, "receipt": receipt, "stdout": result.stdout, "stderr": result.stderr},
+            source="mycodex", status="failed")
+        raise RemoteCommandError("remote launch lacks a valid durable receipt", result)
     remote_commit = parsed.get("REMOTE_COMMIT") or commit or ""
     remote_pid = parsed.get("REMOTE_PID")
     remote_log = parsed.get("REMOTE_LOG") or resolved_log_path
@@ -523,6 +616,11 @@ def launch_remote_job(
         "pid_path": remote_pid_path,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "receipt": receipt,
+        "receipt_verified": receipt_verified,
+        "receipt_path": parsed.get("REMOTE_RECEIPT_PATH"),
+        "execution_status": receipt.get("status") or "unverified",
+        "reused": parsed.get("REMOTE_REUSED") == "1",
     }
     store.add_experiment_event(
         experiment["id"],
@@ -534,7 +632,7 @@ def launch_remote_job(
         status="running",
     )
     post_launch_check: dict[str, Any] | None = None
-    if post_launch_check_delay >= 0:
+    if post_launch_check_delay >= 0 and receipt.get("status") != "completed":
         post_launch_check = _post_launch_status_check(
             target,
             remote_pid,
@@ -545,6 +643,9 @@ def launch_remote_job(
             delay=post_launch_check_delay,
             lines=post_launch_check_lines,
             runner=remote_runner,
+            receipt_path=str(job_payload.get("receipt_path") or ""),
+            execution_id=resolved_execution_id,
+            manifest_sha256=canonical_hash(manifest),
         )
         if post_launch_check.get("check_failed"):
             store.add_experiment_event(
@@ -557,8 +658,18 @@ def launch_remote_job(
                 phase="experiment_running",
                 phase_message="Remote job started, but immediate status verification failed.",
             )
+        elif post_launch_check.get("status") == "needs_reconciliation":
+            store.add_experiment_event(
+                experiment["id"], event_type="remote_job_needs_reconciliation", level="warning",
+                message="Remote process ownership or budget supervisor could not be verified; inspect before continuing.",
+                payload={**job_payload, **post_launch_check}, source="mycodex", phase="waiting_for_decision")
+        elif post_launch_check.get("status") == "completed":
+            store.add_experiment_event(
+                experiment["id"], event_type="remote_job_completed", level="info",
+                message="Remote execution completed successfully; result artifacts still require a gate.",
+                payload={**job_payload, **post_launch_check}, source="mycodex", phase="waiting_for_decision")
         elif post_launch_check.get("status") != "running":
-            failure_hint = _remote_output_has_failure_hint(post_launch_check)
+            failure_hint = _remote_output_has_failure_hint(post_launch_check) or post_launch_check.get("status") in {"failed", "timed_out"}
             store.add_experiment_event(
                 experiment["id"],
                 event_type="remote_job_exited_early",
@@ -567,7 +678,9 @@ def launch_remote_job(
                     f"Remote job pid={remote_pid} was not running "
                     f"{post_launch_check_delay:g}s after launch."
                 ),
-                payload={**job_payload, "post_launch_check": post_launch_check},
+                payload={**job_payload, "post_launch_check": post_launch_check,
+                         "receipt": post_launch_check.get("receipt") if post_launch_check.get("receipt_verified") else job_payload.get("receipt"),
+                         "receipt_verified": post_launch_check.get("receipt_verified", False)},
                 source="mycodex",
                 status="failed" if failure_hint else None,
                 phase="failed" if failure_hint else "waiting_for_decision",
@@ -591,10 +704,13 @@ def _post_launch_status_check(
     delay: float,
     lines: int,
     runner: RemoteRunner | None,
+    receipt_path: str = "",
+    execution_id: str = "",
+    manifest_sha256: str = "",
 ) -> dict[str, Any]:
     if delay > 0:
         time.sleep(delay)
-    script = _remote_status_script(remote_pid, remote_log, max(1, lines))
+    script = _remote_status_script(remote_pid, remote_log, max(1, lines), receipt_path=receipt_path)
     try:
         if runner:
             result = runner(target, script, ssh_key, timeout)
@@ -609,11 +725,28 @@ def _post_launch_status_check(
     except Exception as exc:
         return {"check_failed": True, "error": str(exc)}
     parsed = _parse_key_values(result.stdout)
+    receipt = {}
+    verified = False
+    status = parsed.get("REMOTE_STATUS") or "unknown"
+    try:
+        if parsed.get("REMOTE_RECEIPT"):
+            receipt = json.loads(base64.b64decode(parsed["REMOTE_RECEIPT"]))
+            if not isinstance(receipt, dict):
+                raise ValueError("receipt must be an object")
+            verified = receipt.get("execution_id") == execution_id and receipt.get("manifest_sha256") == manifest_sha256
+            if verified:
+                status = receipt_observation_status(receipt, parsed)
+    except (ValueError, TypeError):
+        receipt = {}
+    if receipt_path and not verified:
+        status = "needs_reconciliation"
     return {
-        "status": parsed.get("REMOTE_STATUS") or "unknown",
+        "status": status,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "check_failed": False,
+        "receipt": receipt,
+        "receipt_verified": verified,
     }
 
 
@@ -654,7 +787,8 @@ def remote_job_status(
     resolved_log = str(log_path or latest_job.get("log_path") or "")
     if not resolved_pid:
         raise ValueError("remote PID is required; pass --pid or launch a remote job first")
-    script = _remote_status_script(resolved_pid, resolved_log, max(1, lines))
+    script = _remote_status_script(resolved_pid, resolved_log, max(1, lines),
+                                   receipt_path=str(latest_job.get("receipt_path") or "") if not pid else "")
     runner = remote_runner or run_remote_script
     if remote_runner:
         result = runner(target, script, str(resolved_ssh_key) if resolved_ssh_key else None, timeout)
@@ -668,6 +802,21 @@ def remote_job_status(
         )
     parsed = _parse_key_values(result.stdout)
     status = parsed.get("REMOTE_STATUS") or "unknown"
+    receipt = {}
+    receipt_verified = False
+    try:
+        if parsed.get("REMOTE_RECEIPT"):
+            receipt = json.loads(base64.b64decode(parsed["REMOTE_RECEIPT"]))
+            if not isinstance(receipt, dict):
+                raise ValueError("receipt must be an object")
+            receipt_verified = (receipt.get("execution_id") == latest_job.get("execution_id")
+                                and receipt.get("manifest_sha256") == latest_job.get("manifest_sha256"))
+            if receipt_verified:
+                status = receipt_observation_status(receipt, parsed)
+    except (ValueError, TypeError):
+        receipt = {}
+    if latest_job.get("receipt_path") and not pid and not receipt_verified:
+        status = "needs_reconciliation"
     level = "info" if status == "running" else "warning"
     store.add_experiment_event(
         experiment["id"],
@@ -682,11 +831,16 @@ def remote_job_status(
             "ssh_auth": "password_file" if resolved_ssh_password_file else ("key" if resolved_ssh_key else "default"),
             "stdout": result.stdout,
             "stderr": result.stderr,
+            "execution_id": latest_job.get("execution_id"),
+            "receipt": receipt,
+            "receipt_verified": receipt_verified,
         },
         source="mycodex",
         phase="experiment_running" if status == "running" else "waiting_for_decision",
     )
-    return {"status": status, "stdout": result.stdout, "stderr": result.stderr}
+    return {"status": status, "stdout": result.stdout, "stderr": result.stderr,
+            "receipt": receipt, "receipt_verified": receipt_verified,
+            "execution_id": latest_job.get("execution_id")}
 
 
 def poll_wandb_run(
@@ -1678,7 +1832,7 @@ def _run_remote_anomaly_control_cycle(
             return {"executed": False, "reason": "peer_review_not_approved", "decision": peer_review_decision}
 
         task_id = int(task_record["task"]["id"])
-        _lease_recorded_protocol_task(
+        lease_owner = _lease_recorded_protocol_task(
             store,
             experiment,
             task_id,
@@ -1686,7 +1840,7 @@ def _run_remote_anomaly_control_cycle(
             owner=f"mycodex-{trigger}",
             lease_seconds=max(60, control_timeout),
         )
-        execution = execute_execution_contract(
+        execution = _execute_with_protocol_lease(
             store,
             project_name,
             experiment_name,
@@ -1697,6 +1851,8 @@ def _run_remote_anomaly_control_cycle(
             remote_python=remote_python,
             allow_full_train=allow_full_train,
             protocol_task_id=task_id,
+            owner=lease_owner,
+            lease_seconds=max(60, control_timeout),
         )
         _complete_recorded_protocol_task(
             store,
@@ -1704,7 +1860,7 @@ def _run_remote_anomaly_control_cycle(
             task_id,
             execution=execution,
             contract=contract,
-            owner=f"mycodex-{trigger}",
+            owner=lease_owner or "",
         )
         if not execution.get("executed"):
             store.add_experiment_event(
@@ -2474,7 +2630,7 @@ def supervise_experiment(
                 break
             executed_contracts.add(contract_fingerprint)
             task_id = int(task_record["task"]["id"])
-            _lease_recorded_protocol_task(
+            lease_owner = _lease_recorded_protocol_task(
                 store,
                 experiment,
                 task_id,
@@ -2482,7 +2638,7 @@ def supervise_experiment(
                 owner="mycodex-supervisor",
                 lease_seconds=max(60, control_timeout),
             )
-            execution = execute_execution_contract(
+            execution = _execute_with_protocol_lease(
                 store,
                 project_name,
                 experiment_name,
@@ -2493,6 +2649,8 @@ def supervise_experiment(
                 remote_python=remote_python,
                 allow_full_train=allow_full_train,
                 protocol_task_id=task_id,
+                owner=lease_owner,
+                lease_seconds=max(60, control_timeout),
             )
             _complete_recorded_protocol_task(
                 store,
@@ -2500,7 +2658,7 @@ def supervise_experiment(
                 task_id,
                 execution=execution,
                 contract=contract,
-                owner="mycodex-supervisor",
+                owner=lease_owner or "",
             )
             last_result = {**last_result, "control": control_result, "contract": contract, "execution": execution}
             launched = execution.get("launch") if isinstance(execution, dict) else None
@@ -3145,244 +3303,6 @@ def _experiment_codex_run_stale_after(kind: str, *, control_timeout_seconds: int
     return max(60, min(control_timeout_seconds, 900) + 60)
 
 
-def extract_execution_contract(text: str) -> dict[str, Any] | None:
-    blocks = [match.group(1) for match in _JSON_BLOCK_RE.finditer(text or "")]
-    candidates = list(reversed(blocks))
-    stripped = (text or "").strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        candidates.append(stripped)
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and (
-            "auto_execute" in parsed or "execution_class" in parsed or "remote" in parsed
-        ):
-            return parsed
-    return None
-
-
-def _execution_contract_parse_failure(text: str) -> str:
-    blocks = [match.group(1) for match in _JSON_BLOCK_RE.finditer(text or "")]
-    candidates = list(reversed(blocks))
-    stripped = (text or "").strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        candidates.append(stripped)
-    if not candidates:
-        return "no fenced JSON object or whole-response JSON object found"
-
-    reasons: list[str] = []
-    for index, candidate in enumerate(candidates, start=1):
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError as exc:
-            excerpt = candidate[max(0, exc.pos - 120) : exc.pos + 120]
-            reasons.append(
-                f"candidate {index} JSONDecodeError at line {exc.lineno} "
-                f"column {exc.colno}: {exc.msg}; excerpt={excerpt!r}"
-            )
-            continue
-        if not isinstance(parsed, dict):
-            reasons.append(f"candidate {index} parsed as {type(parsed).__name__}, not object")
-            continue
-        reasons.append(
-            "candidate "
-            f"{index} missing execution keys auto_execute/execution_class/remote"
-        )
-    return " | ".join(reasons[-3:])
-
-
-def extract_peer_review_decision(text: str) -> dict[str, Any] | None:
-    blocks = [match.group(1) for match in _JSON_BLOCK_RE.finditer(text or "")]
-    candidates = list(reversed(blocks))
-    stripped = (text or "").strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        candidates.append(stripped)
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and "decision" in parsed:
-            return parsed
-    return None
-
-
-def _normalize_policy_tokens(value: Any, default: set[str]) -> set[str]:
-    if value is None:
-        return set(default)
-    if isinstance(value, str):
-        raw_items = re.split(r"[, ]+", value.strip())
-    else:
-        raw_items = []
-        for item in value:
-            raw_items.extend(re.split(r"[, ]+", str(item).strip()))
-    items = {item.strip().lower() for item in raw_items if item.strip()}
-    if "none" in items or "off" in items or "disabled" in items:
-        return set()
-    return items
-
-
-def _peer_review_result_status(peer_review_result: dict[str, Any]) -> str:
-    rounds = peer_review_result.get("rounds") if isinstance(peer_review_result.get("rounds"), list) else []
-    statuses = {str(item.get("status") or "").strip().lower() for item in rounds if isinstance(item, dict)}
-    if any(status in {"timeout", "failed", "cancelled"} for status in statuses):
-        return "timeout"
-    return "completed"
-
-
-def _review_decision_text(peer_review_decision: dict[str, Any] | None) -> str:
-    if not peer_review_decision:
-        return ""
-    return json.dumps(peer_review_decision, ensure_ascii=False, sort_keys=True)
-
-
-def _peer_review_has_required_changes(peer_review_decision: dict[str, Any] | None) -> bool:
-    if not isinstance(peer_review_decision, dict):
-        return False
-    changes = peer_review_decision.get("required_changes")
-    if isinstance(changes, str):
-        return bool(changes.strip())
-    if isinstance(changes, list):
-        return any(str(item).strip() for item in changes)
-    return False
-
-
-def _execution_class(contract: dict[str, Any]) -> str:
-    return str(contract.get("execution_class") or "").strip()
-
-
-def _contract_skips_peer_review(contract: dict[str, Any]) -> bool:
-    return _execution_class(contract) in PEER_REVIEW_EXEMPT_EXECUTION_CLASSES
-
-
-def _phase_for_contract_execution(contract: dict[str, Any]) -> str:
-    execution_class = _execution_class(contract)
-    if execution_class in EVAL_EXECUTION_CLASSES:
-        return "launch_eval"
-    if execution_class in {"read-only-preflight", "monitor-only"}:
-        return "remote_preflight_pending"
-    return "checking_git"
-
-
-def _review_text(peer_review_decision: dict[str, Any] | None) -> str:
-    if not isinstance(peer_review_decision, dict):
-        return ""
-    parts: list[str] = []
-    for key in ("decision", "reason"):
-        value = peer_review_decision.get(key)
-        if value is not None:
-            parts.append(str(value))
-    for key in ("required_changes", "risk_notes", "blockers", "risks"):
-        value = peer_review_decision.get(key)
-        if isinstance(value, list):
-            parts.extend(str(item) for item in value)
-        elif value is not None:
-            parts.append(str(value))
-    return "\n".join(parts).lower()
-
-
-def _peer_review_hard_blockers(
-    peer_review_decision: dict[str, Any] | None,
-    *,
-    contract: dict[str, Any],
-    allow_full_train: bool,
-) -> list[str]:
-    """Return reviewer objections that are allowed to stop execution.
-
-    Peer review is not a general veto. It may only stop destructive actions,
-    unauthorized long/paid training, or overwriting/committing unowned local
-    changes. Method/artifact objections are recorded as soft objections.
-    """
-    text = _review_text(peer_review_decision)
-    blockers: list[str] = []
-    if any(
-        token in text
-        for token in (
-            "destructive",
-            "delete unrelated",
-            "rm -rf",
-            "format disk",
-            "drop table",
-            "破坏性",
-            "删除无关",
-            "清空",
-        )
-    ):
-        blockers.append("destructive_operation")
-    if any(
-        token in text
-        for token in (
-            "billing",
-            "quota",
-            "paid",
-            "spend",
-            "cost",
-            "unauthorized long",
-            "unapproved full",
-            "未授权长训",
-            "账单",
-            "配额",
-            "花钱",
-        )
-    ):
-        blockers.append("unauthorized_cost_or_long_training")
-    if any(
-        token in text
-        for token in (
-            "unowned",
-            "unrelated local",
-            "dirty worktree",
-            "overwrite local",
-            "commit unrelated",
-            "覆盖未归属",
-            "未归属",
-            "无关本地改动",
-        )
-    ):
-        blockers.append("unowned_local_changes")
-    if _execution_class(contract) == "full-train" and not allow_full_train:
-        blockers.append("full_train_without_allow_full_train")
-    return sorted(set(blockers))
-
-
-def _peer_review_soft_objections(peer_review_decision: dict[str, Any] | None) -> list[str]:
-    if not isinstance(peer_review_decision, dict):
-        return []
-    objections: list[str] = []
-    reason = str(peer_review_decision.get("reason") or "").strip()
-    if reason:
-        objections.append(reason)
-    for key in ("required_changes", "risk_notes"):
-        value = peer_review_decision.get(key)
-        if isinstance(value, list):
-            objections.extend(str(item).strip() for item in value if str(item).strip())
-        elif isinstance(value, str) and value.strip():
-            objections.append(value.strip())
-    return objections[:40]
-
-
-def _annotate_contract_with_reviewer_objections(
-    contract: dict[str, Any],
-    peer_review_decision: dict[str, Any] | None,
-    *,
-    reason: str,
-) -> dict[str, Any]:
-    annotated = dict(contract)
-    review = annotated.get("review") if isinstance(annotated.get("review"), dict) else {}
-    review = {
-        **review,
-        "method_claim_allowed": False,
-        "execution_allowed_despite_reviewer_objections": True,
-        "reason": reason,
-        "reviewer_objections": _peer_review_soft_objections(peer_review_decision),
-    }
-    annotated["review"] = review
-    annotated["method_claim_allowed"] = False
-    return annotated
-
-
 def _record_peer_review_skipped(
     store: Store,
     experiment_id: int,
@@ -3489,661 +3409,6 @@ def _pause_with_reviewer_objections(
     }
 
 
-def _remote_eval_command_looks_destructive(command: str) -> bool:
-    return bool(
-        re.search(r"\brm\s+-[^;&|]*[rf]|git\s+(?:push|commit|reset|clean)\b|drop\s+table", command, re.IGNORECASE)
-    )
-
-
-def _contract_bypass_failures(
-    contract: dict[str, Any],
-    *,
-    allow_full_train: bool,
-    allowed_classes: set[str],
-) -> list[str]:
-    failures: list[str] = []
-    execution_class = _execution_class(contract)
-    remote = contract.get("remote") if isinstance(contract.get("remote"), dict) else {}
-    patch_info = contract.get("patch") if isinstance(contract.get("patch"), dict) else {}
-    wandb = contract.get("wandb") if isinstance(contract.get("wandb"), dict) else {}
-
-    if not bool(contract.get("auto_execute")):
-        failures.append("auto_execute_false")
-    if not execution_class:
-        failures.append("missing_execution_class")
-    elif execution_class not in allowed_classes:
-        failures.append(f"execution_class_not_allowed:{execution_class}")
-    if execution_class == "full-train" and not allow_full_train:
-        failures.append("full_train_without_allow_full_train")
-
-    command = str(remote.get("command") or "").strip()
-    budget = str(remote.get("budget") or remote.get("timeout") or remote.get("timeout_seconds") or "").strip()
-    if execution_class in REMOTE_COMMAND_EXECUTION_CLASSES:
-        if not command:
-            failures.append("missing_remote_command")
-        if not budget:
-            failures.append("missing_remote_budget_or_timeout")
-
-    patch_required = bool(patch_info.get("required"))
-    if execution_class in EVAL_EXECUTION_CLASSES:
-        if patch_required:
-            failures.append("eval_class_must_not_require_patch")
-        if _remote_eval_command_looks_destructive(command):
-            failures.append("eval_remote_command_not_read_only")
-        if not contract.get("metrics"):
-            failures.append("missing_eval_metrics")
-        if not contract.get("hard_stop"):
-            failures.append("missing_eval_hard_stop")
-        if wandb and not (wandb.get("project") and (wandb.get("run_id") or wandb.get("run_name"))):
-            failures.append("incomplete_eval_wandb_identity")
-
-    if execution_class in {"smoke-train", "full-train"}:
-        if not contract.get("metrics"):
-            failures.append("missing_metrics")
-        if not contract.get("hard_stop"):
-            failures.append("missing_hard_stop")
-        if not (wandb.get("project") and (wandb.get("run_id") or wandb.get("run_name"))):
-            failures.append("missing_wandb_identity")
-        failures.extend(_contract_research_failures(contract))
-
-    if execution_class == "diagnostic-patch" and not patch_required and not command:
-        failures.append("diagnostic_patch_without_patch_or_command")
-    if patch_required:
-        if not patch_info.get("files"):
-            failures.append("missing_patch_files")
-        if not str(patch_info.get("commit_message") or "").strip():
-            failures.append("missing_patch_commit_message")
-        if not str(patch_info.get("unified_diff") or patch_info.get("diff") or "").strip():
-            failures.append("missing_patch_diff")
-
-    return failures
-
-
-def _contract_task_idempotency_key(
-    contract: dict[str, Any],
-    *,
-    trigger: str,
-    context_key: str = "",
-) -> str:
-    canonical = json.dumps(
-        {
-            "trigger": trigger,
-            "context_key": context_key,
-            "contract": contract,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"contract:{digest}"
-
-
-def _contract_protocol_readiness(
-    contract: dict[str, Any],
-    *,
-    auto_execute_policy: bool,
-    allow_full_train: bool,
-) -> dict[str, Any]:
-    execution_class = _execution_class(contract)
-    failures = _contract_execution_failures(contract, allow_full_train=allow_full_train)
-    completeness_failures = [failure for failure in failures if failure != "auto_execute_false"]
-    requested_auto_execute = bool(contract.get("auto_execute"))
-    if completeness_failures:
-        status = "blocked"
-        reason = "contract_incomplete"
-    elif requested_auto_execute and auto_execute_policy:
-        status = "ready"
-        reason = "contract_ready"
-    else:
-        status = "proposed"
-        reason = "awaiting_auto_execute_authority"
-    return {
-        "status": status,
-        "reason": reason,
-        "execution_class": execution_class,
-        "requested_auto_execute": requested_auto_execute,
-        "policy_auto_execute": bool(auto_execute_policy),
-        "failures": failures,
-        "completeness_failures": completeness_failures,
-    }
-
-
-def record_execution_contract_task(
-    store: Store,
-    project_name: str,
-    experiment_name: str,
-    contract: dict[str, Any],
-    *,
-    trigger: str,
-    auto_execute_policy: bool = True,
-    allow_full_train: bool = False,
-    source_event_id: int | None = None,
-    run_id: int | None = None,
-    context_key: str = "",
-    source: str = "mycodex",
-) -> dict[str, Any]:
-    project = require_project(store, project_name)
-    experiment = _require_experiment(store, project["id"], experiment_name)
-    readiness = _contract_protocol_readiness(
-        contract,
-        auto_execute_policy=auto_execute_policy,
-        allow_full_train=allow_full_train,
-    )
-    task = store.upsert_experiment_task(
-        experiment["id"],
-        task_type="execution_contract",
-        status=readiness["status"],
-        execution_class=readiness["execution_class"],
-        idempotency_key=_contract_task_idempotency_key(
-            contract,
-            trigger=trigger,
-            context_key=context_key,
-        ),
-        contract=contract,
-        source_event_id=source_event_id,
-        run_id=run_id,
-        max_attempts=3,
-        result={
-            "trigger": trigger,
-            "readiness": readiness,
-            "context_key": context_key,
-        },
-    )
-    store.add_experiment_event(
-        experiment["id"],
-        event_type="experiment_task_recorded",
-        level="warning" if readiness["status"] == "blocked" else "info",
-        message=(
-            f"Execution contract task #{task['id']} recorded: "
-            f"status={task['status']} class={readiness['execution_class'] or '<missing>'}."
-        ),
-        payload={
-            "task_id": task["id"],
-            "task_status": task["status"],
-            "trigger": trigger,
-            "readiness": readiness,
-            "context_key": context_key,
-        },
-        source=source,
-        status="running",
-        phase=_phase_for_contract_execution(contract) if task["status"] == "ready" else "waiting_for_decision",
-        phase_message=(
-            "Execution contract is ready and waiting for a worker lease."
-            if task["status"] == "ready"
-            else "Execution contract was recorded but is not ready for automatic execution."
-        ),
-    )
-    return {"task": dict(task), "readiness": readiness}
-
-
-def _protocol_task_outcome(execution: dict[str, Any]) -> tuple[str, str, str, str]:
-    if execution.get("executed"):
-        return "succeeded", "experiment_task_succeeded", "info", "completed"
-    reason = str(execution.get("reason") or "")
-    if reason.startswith("contract_") or reason in {
-        "auto_execute_false",
-        "full_train_not_allowed",
-        "unsupported_execution_class",
-    }:
-        return "blocked", "experiment_task_blocked", "warning", f"blocked: {reason or 'unknown'}"
-    return "failed", "experiment_task_failed", "warning", f"failed: {reason or 'unknown'}"
-
-
-def _lease_recorded_protocol_task(
-    store: Store,
-    experiment,
-    task_id: int,
-    *,
-    contract: dict[str, Any],
-    owner: str,
-    lease_seconds: int = 900,
-) -> None:
-    task = store.get_experiment_task(experiment["id"], task_id)
-    if task is None or task["status"] in EXPERIMENT_TASK_TERMINAL_STATUSES:
-        return
-    if task["status"] != "ready":
-        store.update_experiment_task_status(experiment["id"], task_id, "ready")
-    leased = store.lease_experiment_task(
-        experiment["id"],
-        task_id,
-        owner=owner,
-        lease_seconds=lease_seconds,
-    )
-    if leased is not None:
-        store.add_experiment_event(
-            experiment["id"],
-            event_type="experiment_task_lease_acquired",
-            level="info",
-            message=f"Execution contract task #{task_id} leased by {owner}.",
-            payload={
-                "task_id": task_id,
-                "lease_owner": owner,
-                "lease_expires_at": leased["lease_expires_at"],
-                "execution_class": leased["execution_class"],
-            },
-            source=owner,
-            status="running",
-            phase=_phase_for_contract_execution(contract),
-            phase_message="A protocol worker leased the execution contract.",
-        )
-    store.update_experiment_task_status(
-        experiment["id"],
-        task_id,
-        "running",
-        lease_owner=owner,
-    )
-
-
-def _complete_recorded_protocol_task(
-    store: Store,
-    experiment,
-    task_id: int,
-    *,
-    execution: dict[str, Any],
-    contract: dict[str, Any],
-    owner: str,
-) -> None:
-    task = store.get_experiment_task(experiment["id"], task_id)
-    if task is None or task["status"] in EXPERIMENT_TASK_TERMINAL_STATUSES:
-        return
-    status, event_type, level, outcome = _protocol_task_outcome(execution)
-    store.update_experiment_task_status(
-        experiment["id"],
-        task_id,
-        status,
-        result=execution,
-        error=str(execution.get("reason") or ""),
-    )
-    store.add_experiment_event(
-        experiment["id"],
-        event_type=event_type,
-        level=level,
-        message=f"Execution contract task #{task_id} {outcome}.",
-        payload={"task_id": task_id, "execution": execution},
-        source=owner,
-        status="running",
-        phase=(
-            "launch_eval"
-            if execution.get("launch") and _execution_class(contract) in EVAL_EXECUTION_CLASSES
-            else "experiment_running"
-            if execution.get("launch")
-            else "waiting_for_decision"
-        ),
-    )
-
-
-def recover_stale_experiment_tasks(
-    store: Store,
-    *,
-    project_name: str | None = None,
-    experiment_name: str | None = None,
-    running_timeout_seconds: int = 3600,
-    now: int | None = None,
-    source: str = "mycodex-daemon",
-) -> dict[str, Any]:
-    if running_timeout_seconds < 1:
-        raise ValueError("running_timeout_seconds must be positive")
-    ts = int(time.time()) if now is None else int(now)
-    projects = [require_project(store, project_name)] if project_name else list(store.list_projects())
-    recovered: list[dict[str, Any]] = []
-    for project in projects:
-        experiments = (
-            [_require_experiment(store, project["id"], experiment_name)]
-            if experiment_name
-            else list(store.list_experiments(project["id"]))
-        )
-        for experiment in experiments:
-            for task in store.list_experiment_tasks(
-                experiment["id"],
-                statuses=["leased", "running"],
-                limit=200,
-            ):
-                task_id = int(task["id"])
-                task_status = str(task["status"])
-                lease_expires_at = int(task["lease_expires_at"] or 0)
-                age_seconds = max(0, ts - int(task["updated_at"]))
-                reason = ""
-                next_status = ""
-                event_type = "experiment_task_recovered"
-                level = "info"
-                if task_status == "leased":
-                    if lease_expires_at and lease_expires_at > ts:
-                        continue
-                    reason = "lease_expired_after_local_restart"
-                    next_status = "ready"
-                elif task_status == "running":
-                    if age_seconds < running_timeout_seconds:
-                        continue
-                    events = store.list_experiment_events(experiment["id"], limit=1000)
-                    if _task_has_remote_launch_event(events, task_id):
-                        reason = "stale_running_task_has_remote_launch"
-                        next_status = "blocked"
-                        event_type = "experiment_task_recovery_blocked"
-                        level = "warning"
-                    else:
-                        reason = "stale_running_task_without_remote_launch"
-                        next_status = "ready"
-                if not next_status:
-                    continue
-                updated = store.update_experiment_task_status(
-                    experiment["id"],
-                    task_id,
-                    next_status,
-                    error=reason,
-                    result={
-                        "recovery_reason": reason,
-                        "previous_status": task_status,
-                        "age_seconds": age_seconds,
-                        "lease_expires_at": lease_expires_at or None,
-                    },
-                )
-                store.add_experiment_event(
-                    experiment["id"],
-                    event_type=event_type,
-                    level=level,
-                    message=(
-                        f"Recovered experiment task #{task_id}: {task_status} -> {next_status} "
-                        f"({reason})."
-                    ),
-                    payload={
-                        "task_id": task_id,
-                        "previous_status": task_status,
-                        "status": next_status,
-                        "reason": reason,
-                        "age_seconds": age_seconds,
-                        "lease_expires_at": lease_expires_at or None,
-                    },
-                    source=source,
-                    status="running" if experiment["status"] == "running" else None,
-                    phase="waiting_for_decision" if next_status == "blocked" else experiment["phase"],
-                    phase_message=(
-                        "A stale protocol task had already launched remote work; inspect before retrying."
-                        if next_status == "blocked"
-                        else "A stale protocol task was returned to ready after local restart."
-                    ),
-                )
-                recovered.append(
-                    {
-                        "project": project["name"],
-                        "experiment": experiment["name"],
-                        "task_id": task_id,
-                        "previous_status": task_status,
-                        "status": updated["status"],
-                        "reason": reason,
-                    }
-                )
-    return {"recovered_tasks": len(recovered), "tasks": recovered}
-
-
-def _task_has_remote_launch_event(events: list[Any], task_id: int) -> bool:
-    for event in events:
-        if event["event_type"] not in {
-            "remote_job_started",
-            "remote_pull_completed",
-            "remote_monitor_command_started",
-            "remote_monitor_command_completed",
-        }:
-            continue
-        payload = _event_payload(event)
-        if _payload_mentions_protocol_task(payload, task_id):
-            return True
-    return False
-
-
-def _payload_mentions_protocol_task(value: Any, task_id: int) -> bool:
-    if isinstance(value, dict):
-        task_id_str = str(task_id)
-        if str(value.get("protocol_task_id") or "") == task_id_str or str(value.get("task_id") or "") == task_id_str:
-            return True
-        return any(_payload_mentions_protocol_task(child, task_id) for child in value.values())
-    if isinstance(value, list):
-        return any(_payload_mentions_protocol_task(child, task_id) for child in value)
-    return False
-
-
-def run_ready_experiment_tasks(
-    store: Store,
-    project_name: str,
-    experiment_name: str,
-    *,
-    owner: str = "mycodex-protocol-worker",
-    lease_seconds: int = 900,
-    max_tasks: int = 1,
-    ssh_key: str | None = None,
-    ssh_password_file: str | None = None,
-    remote_ref: str | None = None,
-    remote_python: str | None = None,
-    allow_full_train: bool = False,
-) -> dict[str, Any]:
-    if max_tasks < 1:
-        raise ValueError("max_tasks must be positive")
-    project = require_project(store, project_name)
-    experiment = _require_experiment(store, project["id"], experiment_name)
-    results: list[dict[str, Any]] = []
-    for _ in range(max_tasks):
-        task = store.lease_next_experiment_task(
-            experiment["id"],
-            owner=owner,
-            lease_seconds=lease_seconds,
-        )
-        if task is None:
-            break
-        task_id = int(task["id"])
-        try:
-            contract = json.loads(task["contract_json"] or "{}")
-        except json.JSONDecodeError as exc:
-            updated = store.update_experiment_task_status(
-                experiment["id"],
-                task_id,
-                "failed",
-                error=f"contract_json decode failed: {exc}",
-            )
-            store.add_experiment_event(
-                experiment["id"],
-                event_type="experiment_task_failed",
-                level="error",
-                message=f"Execution contract task #{task_id} has invalid JSON.",
-                payload={"task_id": task_id, "error": str(exc)},
-                source=owner,
-                phase="waiting_for_decision",
-            )
-            results.append({"task": dict(updated), "executed": False, "reason": "invalid_contract_json"})
-            continue
-        store.add_experiment_event(
-            experiment["id"],
-            event_type="experiment_task_lease_acquired",
-            level="info",
-            message=f"Execution contract task #{task_id} leased by {owner}.",
-            payload={
-                "task_id": task_id,
-                "lease_owner": owner,
-                "lease_expires_at": task["lease_expires_at"],
-                "execution_class": task["execution_class"],
-            },
-            source=owner,
-            status="running",
-            phase=_phase_for_contract_execution(contract),
-            phase_message="A protocol worker leased the execution contract.",
-        )
-        store.update_experiment_task_status(
-            experiment["id"],
-            task_id,
-            "running",
-            lease_owner=owner,
-        )
-        execution = execute_execution_contract(
-            store,
-            project_name,
-            experiment_name,
-            contract,
-            ssh_key=ssh_key,
-            ssh_password_file=ssh_password_file,
-            remote_ref=remote_ref,
-            remote_python=remote_python,
-            allow_full_train=allow_full_train,
-            protocol_task_id=task_id,
-        )
-        _complete_recorded_protocol_task(
-            store,
-            experiment,
-            task_id,
-            execution=execution,
-            contract=contract,
-            owner=owner,
-        )
-        updated = store.get_experiment_task(experiment["id"], task_id)
-        if updated is None:
-            raise RuntimeError(f"experiment task #{task_id} disappeared during execution")
-        results.append({"task": dict(updated), "execution": execution})
-    return {"executed_tasks": len(results), "tasks": results}
-
-
-def _has_contract_content(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, list):
-        return any(_has_contract_content(item) for item in value)
-    if isinstance(value, dict):
-        return any(_has_contract_content(item) for item in value.values())
-    return value is not None
-
-
-def _contract_research_failures(contract: dict[str, Any]) -> list[str]:
-    execution_class = str(contract.get("execution_class") or "").strip()
-    if execution_class not in RESEARCH_REQUIRED_EXECUTION_CLASSES:
-        return []
-
-    research = contract.get("research")
-    if not isinstance(research, dict):
-        return ["missing_research_block"]
-
-    failures: list[str] = []
-    for field in RESEARCH_REQUIRED_SCALAR_FIELDS:
-        if not _has_contract_content(research.get(field)):
-            failures.append(f"missing_research_{field}")
-    for field in RESEARCH_REQUIRED_LIST_FIELDS:
-        value = research.get(field)
-        if not isinstance(value, list) or not _has_contract_content(value):
-            failures.append(f"missing_research_{field}")
-
-    criteria = research.get("decision_criteria")
-    if not isinstance(criteria, dict):
-        failures.append("missing_research_decision_criteria")
-    else:
-        for key in RESEARCH_REQUIRED_DECISION_KEYS:
-            if not _has_contract_content(criteria.get(key)):
-                failures.append(f"missing_research_decision_criteria_{key}")
-    return failures
-
-
-def _peer_review_blocked_since(
-    events: list[Any],
-    *,
-    trigger: str,
-    key_field: str | None = None,
-    key_value: str | None = None,
-) -> int | None:
-    matched_times: list[int] = []
-    for event in events:
-        payload = _event_payload(event)
-        if trigger and payload.get("trigger") not in {None, trigger}:
-            continue
-        if key_field and key_value:
-            payload_key = str(payload.get(key_field) or "")
-            key_missing = not payload_key
-            key_matches = payload_key == str(key_value)
-            if not key_matches and not (
-                key_missing
-                and trigger == "supervisor"
-                and event["event_type"] in {"supervisor_action_completed", "supervisor_stopped"}
-            ):
-                continue
-        event_type = event["event_type"]
-        decision_payload = payload.get("decision") if isinstance(payload.get("decision"), dict) else payload
-        decision = str((decision_payload or {}).get("decision") or "").strip().lower()
-        if event_type in {
-            "remote_anomaly_control_completed",
-            "supervisor_action_completed",
-        } or (event_type == "peer_review_decision" and decision == "approve"):
-            break
-        if event_type not in {
-            "peer_review_decision",
-            "peer_review_failed",
-            "remote_anomaly_control_failed",
-            "supervisor_retry_scheduled",
-        }:
-            continue
-        if decision in {"revise", "timeout"} or event_type in {
-            "peer_review_failed",
-            "remote_anomaly_control_failed",
-            "supervisor_retry_scheduled",
-        }:
-            matched_times.append(int(event["created_at"]))
-    return min(matched_times) if matched_times else None
-
-
-def _assess_peer_review_bypass(
-    *,
-    contract: dict[str, Any],
-    peer_review_decision: dict[str, Any] | None,
-    peer_review_result: dict[str, Any],
-    decision: str,
-    blocked_since: int,
-    now: int,
-    allow_full_train: bool,
-    timeout_seconds: int,
-    bypass_on: Any,
-    allowed_classes: Any,
-) -> dict[str, Any]:
-    normalized_decision = decision or (
-        "timeout" if _peer_review_result_status(peer_review_result) == "timeout" else "unknown"
-    )
-    policy_on = _normalize_policy_tokens(bypass_on, DEFAULT_PEER_REVIEW_BYPASS_ON)
-    policy_classes = _normalize_policy_tokens(
-        allowed_classes,
-        DEFAULT_PEER_REVIEW_BYPASS_ALLOWED_CLASSES,
-    )
-    age = max(0, now - int(blocked_since))
-    failures: list[str] = []
-    warnings: list[str] = []
-    if normalized_decision == "block":
-        failures.append("peer_review_block_is_not_bypassable")
-    if normalized_decision == "revise" and _peer_review_has_required_changes(peer_review_decision):
-        warnings.append("peer_review_required_changes_present")
-    if normalized_decision not in policy_on:
-        failures.append(f"decision_not_bypassable:{normalized_decision or '<missing>'}")
-    if age < max(0, timeout_seconds):
-        failures.append(f"peer_review_block_age_below_timeout:{age}<{timeout_seconds}")
-    failures.extend(
-        _contract_bypass_failures(
-            contract,
-            allow_full_train=allow_full_train,
-            allowed_classes=policy_classes,
-        )
-    )
-    return {
-        "eligible": not failures,
-        "decision": normalized_decision,
-        "blocked_age_seconds": age,
-        "blocked_since": blocked_since,
-        "timeout_seconds": timeout_seconds,
-        "bypass_on": sorted(policy_on),
-        "allowed_classes": sorted(policy_classes),
-        "failures": failures,
-        "warnings": warnings,
-        "review_excerpt": _review_decision_text(peer_review_decision)[:1200],
-    }
-
-
-def _contract_execution_failures(contract: dict[str, Any], *, allow_full_train: bool) -> list[str]:
-    return _contract_bypass_failures(
-        contract,
-        allow_full_train=allow_full_train,
-        allowed_classes=LOW_RISK_EXECUTION_CLASSES | {"full-train"},
-    )
-
-
 def execute_execution_contract(
     store: Store,
     project_name: str,
@@ -4156,10 +3421,19 @@ def execute_execution_contract(
     remote_python: str | None = None,
     allow_full_train: bool = False,
     protocol_task_id: int | None = None,
+    execution_guard: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     project = require_project(store, project_name)
     experiment = _require_experiment(store, project["id"], experiment_name)
     repo = Path(project["path"])
+    try:
+        _validate_experiment_contract_types(contract)
+    except (ValueError, TypeError) as exc:
+        store.add_experiment_event(
+            experiment["id"], event_type="blocked", level="warning",
+            message=f"Execution contract has invalid field types: {exc}",
+            payload={"error": str(exc), "protocol_task_id": protocol_task_id}, source="mycodex")
+        return {"executed": False, "reason": "contract_invalid", "failures": [str(exc)]}
     execution_class = str(contract.get("execution_class") or "").strip()
     auto_execute_flag = bool(contract.get("auto_execute"))
 
@@ -4199,6 +3473,29 @@ def execute_execution_contract(
         return {"executed": False, "reason": "unsupported_execution_class"}
 
     contract_failures = _contract_execution_failures(contract, allow_full_train=allow_full_train)
+    policy = _experiment_config(experiment).get("execution_policy", {})
+    if policy is None:
+        policy = {}
+    if not isinstance(policy, dict):
+        contract_failures.append("policy_must_be_object")
+        policy = {}
+    contract_remote = contract.get("remote") or {}
+    policy_command, _ = _prepare_remote_contract_command(str(contract_remote.get("command") or ""),
+                                                        _resolve_remote_python(experiment, remote_python))
+    contract_failures.extend(execution_policy_failures(
+        {**contract, "remote": {**contract_remote, "command": policy_command}}, policy))
+    contract_failures.extend(patch_scope_failures(repo, contract.get("patch") or {}, policy))
+    resolved_target = remote_ref or experiment["remote_ref"] or _experiment_config(experiment).get("remote_ref")
+    if policy_command and policy.get("allowed_remote_refs") is not None:
+        if not resolved_target or parse_remote_ref(str(resolved_target)).ref not in policy["allowed_remote_refs"]:
+            contract_failures.append("policy_remote_target_not_allowed")
+    try:
+        check_limit = min(float(policy.get("max_local_check_seconds", 300)),
+                          float(contract.get("local_check_timeout_seconds", 300)))
+        if not math.isfinite(check_limit) or check_limit <= 0:
+            raise ValueError("nonpositive or nonfinite check limit")
+    except (ValueError, TypeError):
+        contract_failures.append("policy_invalid_max_local_check_seconds")
     if contract_failures:
         store.add_experiment_event(
             experiment["id"],
@@ -4219,11 +3516,25 @@ def execute_execution_contract(
     patch_info = contract.get("patch") if isinstance(contract.get("patch"), dict) else {}
     patch_required = bool(patch_info.get("required"))
     files = [str(item) for item in patch_info.get("files") or []]
+    if execution_guard is not None and not execution_guard():
+        return {"executed": False, "reason": "contract_lease_lost_requires_reconciliation"}
     commit_result: dict[str, Any] | None = None
     patch_applied = False
     diff = ""
 
     if patch_required:
+        staged = _git_text(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0")
+        dirty = _git_text(repo, ["diff", "--name-only", "-z"]).split("\0")
+        untracked = _git_text(repo, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0")
+        overlaps = sorted(set(files) & (set(dirty) | set(untracked) | set(staged)))
+        unrelated_staged = sorted(set(staged) - set(files) - {""})
+        if overlaps or unrelated_staged:
+            failures = {"dirty_patch_files": overlaps, "unrelated_staged_files": unrelated_staged}
+            store.add_experiment_event(
+                experiment["id"], event_type="blocked", level="warning",
+                message="Patch overlaps existing local changes or an unrelated staged file; refusing to commit user-owned work.",
+                payload={**failures, "protocol_task_id": protocol_task_id}, source="mycodex")
+            return {"executed": False, "reason": "contract_unowned_local_changes", **failures}
         raw_diff = str(patch_info.get("unified_diff") or patch_info.get("diff") or "")
         if not raw_diff.strip():
             store.add_experiment_event(
@@ -4250,7 +3561,10 @@ def execute_execution_contract(
         _git_apply(repo, diff)
         patch_applied = True
 
-    check_results = _run_local_checks(repo, contract.get("local_checks") or [], contract=contract)
+    check_results = _run_local_checks(repo, contract.get("local_checks") or [], contract=contract,
+                                     timeout_seconds=check_limit, execution_guard=execution_guard)
+    if execution_guard is not None and not execution_guard():
+        return {"executed": False, "reason": "contract_lease_lost_requires_reconciliation", "checks": check_results}
     failed_checks = [item for item in check_results if item["returncode"] != 0]
     if failed_checks:
         rollback_result = None
@@ -4287,13 +3601,21 @@ def execute_execution_contract(
 
     if patch_required:
         commit_message = str(patch_info.get("commit_message") or "Apply experiment iteration patch")
-        commit_result = git_commit_push(
-            store,
-            project_name,
-            experiment_name,
-            commit_message=commit_message,
-            paths=files,
-        )
+        try:
+            commit_result = git_commit_push(
+                store,
+                project_name,
+                experiment_name,
+                commit_message=commit_message,
+                paths=files,
+            )
+        except Exception as exc:
+            store.add_experiment_event(
+                experiment["id"], event_type="external_execution_reconciliation_required", level="warning",
+                message=f"Commit/push outcome requires reconciliation: {exc}",
+                payload={"error": str(exc), "protocol_task_id": protocol_task_id}, source="mycodex")
+            return {"executed": False, "reason": "contract_commit_requires_reconciliation", "error": str(exc),
+                    "checks": check_results}
 
     remote = contract.get("remote") if isinstance(contract.get("remote"), dict) else {}
     command = str(remote.get("command") or "").strip()
@@ -4303,6 +3625,8 @@ def execute_execution_contract(
     )
     remote_command_result: dict[str, Any] | None = None
     launch_result: dict[str, Any] | None = None
+    if execution_guard is not None and not execution_guard():
+        return {"executed": False, "reason": "contract_lease_lost_requires_reconciliation", "checks": check_results}
     if command and execution_class == "monitor-only":
         resolved_remote_ref = remote_ref or experiment["remote_ref"] or _experiment_config(experiment).get("remote_ref")
         if not resolved_remote_ref:
@@ -4316,13 +3640,31 @@ def execute_execution_contract(
                 phase="waiting_for_decision",
             )
             return {"executed": False, "reason": "remote_ref_missing", "checks": check_results}
-        timeout_value = remote.get("timeout") or remote.get("timeout_seconds") or 300
+        timeout_value = resolve_time_budget(remote) or 300
         try:
-            monitor_timeout = int(timeout_value)
+            monitor_timeout = float(timeout_value)
         except (TypeError, ValueError):
             monitor_timeout = 300
-        monitor_timeout = max(1, monitor_timeout)
         target = parse_remote_ref(str(resolved_remote_ref))
+        if policy.get("allowed_remote_refs") is not None and target.ref not in policy["allowed_remote_refs"]:
+            return {"executed": False, "reason": "contract_remote_target_not_allowed"}
+        monitor_id = validate_execution_id(contract.get("execution_id") or remote.get("execution_id") or "exec-" + canonical_hash({
+            "project_id": project["id"], "experiment_id": experiment["id"], "remote_ref": target.ref,
+            "protocol_task_id": protocol_task_id, "contract": contract, "command": command})[:32])
+        monitor_env = _validate_env(remote.get("env") or {})
+        code_commit = str(remote.get("commit") or contract.get("commit") or "") or None
+        if code_commit is None and (repo / ".git").exists():
+            code_commit = _git_text(repo, ["rev-parse", "HEAD"])
+        monitor_manifest = build_execution_manifest(
+            execution_id=monitor_id, project_id=project["id"], experiment_id=experiment["id"],
+            remote_ref=target.ref, commit=code_commit, command=command, env=monitor_env,
+            contract=contract, protocol_task_id=protocol_task_id, time_budget_seconds=monitor_timeout,
+            termination_grace_seconds=float(remote.get("termination_grace_seconds", 30)))
+        monitor_manifest_path = persist_execution_manifest(store.path.parent / "experiment_artifacts", monitor_manifest)
+        manifest_ref = {"execution_id": monitor_id, "manifest_path": str(monitor_manifest_path.resolve())}
+        store.add_experiment_event(experiment["id"], event_type="execution_manifest_saved", level="info",
+            message=f"Saved immutable monitor execution manifest for {monitor_id}.",
+            payload={**manifest_ref, "manifest": monitor_manifest}, source="mycodex")
         store.add_experiment_event(
             experiment["id"],
             event_type="remote_monitor_command_started",
@@ -4335,6 +3677,7 @@ def execute_execution_contract(
                 **command_env,
                 "ssh_auth": "password_file" if ssh_password_file else ("key" if ssh_key else "default"),
                 "protocol_task_id": protocol_task_id,
+                **manifest_ref,
             },
             source="mycodex",
             status="running",
@@ -4344,9 +3687,9 @@ def execute_execution_contract(
         try:
             result = run_remote_script(
                 target,
-                command,
+                render_bounded_command(command, monitor_timeout, float(remote.get("termination_grace_seconds", 30)), monitor_env),
                 str(Path(ssh_key).expanduser()) if ssh_key else None,
-                monitor_timeout,
+                math.ceil(monitor_timeout + float(remote.get("termination_grace_seconds", 30)) + 10),
                 ssh_password_file=str(ssh_password_file) if ssh_password_file else None,
             )
         except Exception as exc:
@@ -4370,7 +3713,15 @@ def execute_execution_contract(
             "stdout": result.stdout[-8000:],
             "stderr": result.stderr[-8000:],
             "returncode": result.returncode,
+            **manifest_ref,
         }
+        if result.returncode != 0:
+            store.add_experiment_event(
+                experiment["id"], event_type="remote_monitor_command_failed", level="error",
+                message=f"Monitor-only remote command exited with {result.returncode}.",
+                payload={**remote_command_result, "protocol_task_id": protocol_task_id}, source="mycodex")
+            return {"executed": False, "reason": "remote_monitor_command_failed", "checks": check_results,
+                    "remote_command": remote_command_result}
         store.add_experiment_event(
             experiment["id"],
             event_type="remote_monitor_command_completed",
@@ -4420,23 +3771,44 @@ def execute_execution_contract(
                     phase="launch_eval",
                     phase_message="Launching eval from explicit commit despite local dirty worktree.",
                 )
-        launch_result = launch_remote_job(
-            store,
-            project_name,
-            experiment_name,
-            command=command,
-            remote_ref=remote_ref,
-            ssh_key=ssh_key,
-            ssh_password_file=ssh_password_file,
-            commit=commit,
-            require_clean=not (commit_result or allow_dirty_launch or eval_uses_explicit_commit),
-            env=remote.get("env") if isinstance(remote.get("env"), dict) else {},
-            wandb_entity=wandb.get("entity") if launch_tracks_wandb else None,
-            wandb_project=wandb.get("project") if launch_tracks_wandb else None,
-            wandb_run_id=wandb.get("run_id") if launch_tracks_wandb else None,
-            wandb_run_name=wandb.get("run_name") if launch_tracks_wandb else None,
-            timeout=180,
-        )
+        try:
+            launch_result = launch_remote_job(
+                store,
+                project_name,
+                experiment_name,
+                command=command,
+                remote_ref=remote_ref,
+                ssh_key=ssh_key,
+                ssh_password_file=ssh_password_file,
+                commit=commit,
+                require_clean=not (commit_result or allow_dirty_launch or eval_uses_explicit_commit),
+                env=remote.get("env") if isinstance(remote.get("env"), dict) else {},
+                wandb_entity=wandb.get("entity") if launch_tracks_wandb else None,
+                wandb_project=wandb.get("project") if launch_tracks_wandb else None,
+                wandb_run_id=wandb.get("run_id") if launch_tracks_wandb else None,
+                wandb_run_name=wandb.get("run_name") if launch_tracks_wandb else None,
+                timeout=180,
+                execution_id=contract.get("execution_id") or remote.get("execution_id"),
+                execution_contract=contract,
+                protocol_task_id=protocol_task_id,
+                time_budget_seconds=resolve_time_budget(remote),
+                termination_grace_seconds=float(remote.get("termination_grace_seconds", 30)),
+            )
+        except Exception as exc:
+            store.add_experiment_event(
+                experiment["id"], event_type="external_execution_reconciliation_required", level="warning",
+                message=f"Remote launch requires reconciliation before retry: {exc}",
+                payload={"error": str(exc), "protocol_task_id": protocol_task_id}, source="mycodex",
+                phase="waiting_for_decision")
+            return {"executed": False, "reason": "contract_remote_launch_requires_reconciliation",
+                    "error": str(exc), "checks": check_results, "commit": commit_result}
+        post_check = launch_result.get("post_launch_check") or {}
+        if post_check.get("status") == "needs_reconciliation":
+            return {"executed": False, "reason": "contract_remote_execution_needs_reconciliation",
+                    "launch": launch_result, "checks": check_results, "commit": commit_result}
+        if post_check.get("status") in {"failed", "timed_out"} or (post_check.get("status") == "not_running" and _remote_output_has_failure_hint(post_check)):
+            return {"executed": False, "reason": "remote_job_exited_early", "launch": launch_result,
+                    "checks": check_results, "commit": commit_result}
 
     store.add_experiment_event(
         experiment["id"],
@@ -4467,6 +3839,62 @@ def execute_execution_contract(
         "launch": launch_result,
         "remote_command": remote_command_result,
     }
+
+
+def record_execution_result(
+    store: Store, project_name: str, experiment_name: str, execution_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Record supplied result metadata; verify files and use only observed remote receipts."""
+    project = require_project(store, project_name)
+    experiment = _require_experiment(store, project["id"], experiment_name)
+    root = store.path.parent / "experiment_artifacts"
+    manifest = read_execution_manifest(root, execution_id)
+    if manifest["project_id"] != project["id"] or manifest["experiment_id"] != experiment["id"]:
+        raise ValueError("execution manifest belongs to a different project or experiment")
+    checked = dict(result)
+    checked["execution_id"] = execution_id
+    receipt = None
+    for event in store.list_experiment_events(experiment["id"], limit=500):
+        payload = _event_payload(event)
+        if payload.get("execution_id") == execution_id and payload.get("receipt_verified"):
+            candidate = payload.get("receipt") or {}
+            if (candidate.get("status") in {"completed", "failed", "timed_out"}
+                    and candidate.get("execution_id") == execution_id
+                    and candidate.get("manifest_sha256") == canonical_hash(manifest)):
+                receipt = candidate
+                break
+    checked["receipt_verified"] = receipt is not None
+    if receipt:
+        checked["status"] = receipt.get("status")
+        checked["exit_code"] = receipt.get("exit_code")
+    artifact_checks = []
+    for artifact in result.get("artifact_refs") or []:
+        if not isinstance(artifact, dict) or not artifact.get("path") or not artifact.get("sha256"):
+            artifact_checks.append({"verified": False, "reason": "local path and sha256 required"})
+            continue
+        path = Path(str(artifact["path"])).expanduser()
+        digest = hashlib.sha256()
+        try:
+            if not path.is_file():
+                raise OSError("result artifact is not a regular file")
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            artifact_checks.append({"path": str(path.resolve()), "sha256": digest.hexdigest(),
+                                    "verified": digest.hexdigest() == artifact["sha256"]})
+        except OSError as exc:
+            artifact_checks.append({"path": str(path), "verified": False, "reason": str(exc)})
+    checked["artifact_verification"] = artifact_checks
+    checked["artifacts_verified"] = bool(artifact_checks) and all(item["verified"] for item in artifact_checks)
+    gate = assess_result_evidence(manifest, checked)
+    artifact_path = persist_execution_result(root, manifest, checked, gate)
+    store.add_experiment_event(
+        experiment["id"], event_type="result_gate_parsed", level="info",
+        message=f"Result evidence assessed as {gate['evidence_level']} for {execution_id}.",
+        payload={**gate, "result_path": str(artifact_path.resolve()), "artifact_verification": artifact_checks},
+        source="mycodex")
+    return {**gate, "result_path": str(artifact_path.resolve()), "artifact_verification": artifact_checks}
 
 
 def fetch_wandb_run(run_ref: WandbRunRef, metrics: list[str], history_limit: int) -> dict[str, Any]:
@@ -4668,50 +4096,23 @@ def _remote_launch_script(
     log_path: str,
     pid_path: str,
     env: dict[str, str],
+    execution_id: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    time_budget_seconds: float | None = None,
+    termination_grace_seconds: float = 30,
 ) -> str:
-    exports = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
-    return f"""set -euo pipefail
-REMOTE_WORKDIR={shlex.quote(target.path)}
-TARGET_COMMIT={shlex.quote(commit or "")}
-TARGET_BRANCH={shlex.quote(branch or "")}
-FETCH_REMOTE={shlex.quote("1" if fetch else "0")}
-JOB_COMMAND={shlex.quote(command)}
-LOG_PATH={shlex.quote(log_path)}
-PID_PATH={shlex.quote(pid_path)}
-
-cd "$REMOTE_WORKDIR"
-if [ "$FETCH_REMOTE" = "1" ]; then
-  git fetch --all --prune
-fi
-if [ -n "$TARGET_COMMIT" ]; then
-  git checkout --detach "$TARGET_COMMIT"
-elif [ -n "$TARGET_BRANCH" ]; then
-  git checkout "$TARGET_BRANCH"
-  git pull --ff-only
-fi
-REMOTE_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
-case "$LOG_PATH" in
-  /*) ;;
-  *) LOG_PATH="$PWD/$LOG_PATH" ;;
-esac
-case "$PID_PATH" in
-  /*) ;;
-  *) PID_PATH="$PWD/$PID_PATH" ;;
-esac
-mkdir -p "$(dirname "$LOG_PATH")" "$(dirname "$PID_PATH")"
-{exports}
-nohup bash -lc "$JOB_COMMAND" > "$LOG_PATH" 2>&1 < /dev/null &
-REMOTE_PID="$!"
-printf '%s\\n' "$REMOTE_PID" > "$PID_PATH"
-printf 'REMOTE_COMMIT=%s\\n' "$REMOTE_COMMIT"
-printf 'REMOTE_PID=%s\\n' "$REMOTE_PID"
-printf 'REMOTE_LOG=%s\\n' "$LOG_PATH"
-printf 'REMOTE_PID_FILE=%s\\n' "$PID_PATH"
-"""
+    identity = execution_id or "exec-" + canonical_hash({"target": target.ref, "command": command,
+                                                        "commit": commit, "env": env})[:32]
+    return render_remote_launch_script(
+        workdir=target.path, execution_id=identity, command=command, commit=commit,
+        branch=branch, fetch=fetch, log_path=log_path, pid_path=pid_path, env=env,
+        manifest=manifest or {"execution_id": identity}, time_budget_seconds=time_budget_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
 
 
-def _remote_status_script(pid: str, log_path: str, lines: int) -> str:
-    return f"""set -euo pipefail
+def _remote_status_script(pid: str, log_path: str, lines: int, *, receipt_path: str = "") -> str:
+    script = f"""set -euo pipefail
 PID={shlex.quote(pid)}
 LOG_PATH={shlex.quote(log_path)}
 LINES={shlex.quote(str(lines))}
@@ -4734,6 +4135,9 @@ if [ -n "$LOG_PATH" ] && [ -f "$LOG_PATH" ]; then
   printf 'REMOTE_LOG_TAIL_END\\n'
 fi
 """
+    if receipt_path:
+        script += "python3 -c " + shlex.quote(REMOTE_RECEIPT_OBSERVATION_SOURCE) + " " + shlex.quote(receipt_path) + "\n"
+    return script
 
 
 def _ssh_args(
@@ -6045,16 +5449,6 @@ def _latest_event_of_types(events, event_types: set[str]):
     return None
 
 
-def _event_payload(event) -> dict[str, Any]:
-    if event is None:
-        return {}
-    try:
-        parsed = json.loads(event["payload_json"] or "{}")
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _resolve_watchdog_run_path(
     explicit_run_path: str | None,
     latest_job: dict[str, Any],
@@ -6119,16 +5513,6 @@ def _remote_snapshot_has_active_work(snapshot: Any) -> bool:
     return False
 
 
-def _contract_summary(contract: dict[str, Any]) -> str:
-    execution_class = str(contract.get("execution_class") or "<missing>")
-    auto_execute = bool(contract.get("auto_execute"))
-    reason = str(contract.get("reason") or "").strip()
-    parts = [f"Control contract parsed: class={execution_class}", f"auto_execute={auto_execute}"]
-    if reason:
-        parts.append(reason)
-    return "; ".join(parts) + "."
-
-
 def _run_path_from_launch_or_contract(
     launch: dict[str, Any] | None,
     contract: dict[str, Any],
@@ -6154,31 +5538,6 @@ def _run_path_from_launch_or_contract(
     return None
 
 
-def _contract_produces_wandb_run(contract: dict[str, Any]) -> bool:
-    """Whether executing this contract is expected to create a new W&B run."""
-    remote = contract.get("remote") if isinstance(contract.get("remote"), dict) else {}
-    wandb = contract.get("wandb") if isinstance(contract.get("wandb"), dict) else {}
-    for explicit in (
-        remote.get("produces_wandb"),
-        remote.get("produces_wandb_run"),
-        wandb.get("produces_run"),
-    ):
-        if explicit is not None:
-            return bool(explicit)
-    execution_class = str(contract.get("execution_class") or "").strip()
-    return execution_class in WANDB_PRODUCING_EXECUTION_CLASSES
-
-
-def _contract_monitors_wandb_run(contract: dict[str, Any]) -> bool:
-    """Whether this contract intentionally points the supervisor at an existing W&B run."""
-    execution_class = str(contract.get("execution_class") or "").strip()
-    return execution_class == "monitor-only"
-
-
-def _is_real_wandb_run_id(value: Any) -> bool:
-    return str(value or "").strip() not in PLACEHOLDER_WANDB_RUN_IDS
-
-
 def _terminal_event_key(
     terminal_reason: str,
     *,
@@ -6196,24 +5555,6 @@ def _terminal_event_key(
         status = remote_result.get("status") or terminal_reason
         return f"remote:{remote_pid or ''}:{remote_log_path or ''}:{status}"
     return f"terminal:{terminal_reason}:{run_path or ''}:{remote_pid or ''}:{remote_log_path or ''}"
-
-
-def _contract_execution_fingerprint(contract: dict[str, Any]) -> str:
-    remote = contract.get("remote") if isinstance(contract.get("remote"), dict) else {}
-    patch = contract.get("patch") if isinstance(contract.get("patch"), dict) else {}
-    wandb = contract.get("wandb") if isinstance(contract.get("wandb"), dict) else {}
-    identity = {
-        "execution_class": str(contract.get("execution_class") or ""),
-        "remote_command": str(remote.get("command") or ""),
-        "remote_env": remote.get("env") if isinstance(remote.get("env"), dict) else {},
-        "patch_required": bool(patch.get("required")),
-        "patch_files": patch.get("files") or [],
-        "patch_diff": str(patch.get("unified_diff") or patch.get("diff") or ""),
-        "wandb_entity": wandb.get("entity"),
-        "wandb_project": wandb.get("project"),
-        "wandb_run_id": wandb.get("run_id"),
-    }
-    return json.dumps(identity, sort_keys=True, ensure_ascii=False)
 
 
 def _experiment_config(experiment) -> dict[str, Any]:
@@ -6280,13 +5621,6 @@ def _config_list(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _require_experiment(store: Store, project_id: int, experiment_name: str):
-    experiment = store.get_experiment(project_id, experiment_name)
-    if experiment is None:
-        raise ValueError(f"unknown experiment {experiment_name!r}; run `mycodex experiments create` first")
-    return experiment
-
-
 def _ensure_git_repo(path: Path) -> None:
     _git_text(path, ["rev-parse", "--git-dir"])
 
@@ -6297,11 +5631,13 @@ def _git_text(path: Path, args: list[str]) -> str:
         text=True,
         capture_output=True,
         check=False,
+        timeout=120,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
-    return completed.stdout.strip()
+    return completed.stdout if "-z" in args else completed.stdout.strip()
 
 
 def _git_apply(path: Path, diff: str) -> None:
@@ -6337,14 +5673,71 @@ def _rollback_applied_patch(path: Path, diff: str) -> dict[str, Any]:
     return {"rolled_back": True}
 
 
+def _run_local_check_command(path: Path, command: str, timeout_seconds: float) -> subprocess.CompletedProcess:
+    """Bound check commands and terminate their process group/tree on expiration."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("local check timeout must be finite and positive")
+    options: dict[str, Any] = {"cwd": path, "shell": True, "text": True,
+                               "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **options)
+    except OSError as exc:
+        return subprocess.CompletedProcess(command, 127, "", f"Could not start local check: {exc}")
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        return subprocess.CompletedProcess(command, process.returncode, stdout or "", stderr or "")
+    except subprocess.TimeoutExpired:
+        termination_error = ""
+        if os.name == "nt":
+            try:
+                terminated = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                if terminated.returncode != 0 and process.poll() is None:
+                    termination_error = "process-tree termination was not verified; inspect child processes"
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                termination_error = f"process-tree termination failed: {exc}"
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
+            termination_error = termination_error or "child pipe stayed open after termination; inspect detached descendants"
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return subprocess.CompletedProcess(command, 124, stdout or "",
+            (stderr or "") + f"\nLocal check exceeded {timeout_seconds:g}s. {termination_error}".rstrip())
+
+
 def _run_local_checks(
     path: Path,
     checks: list[Any],
     *,
     contract: dict[str, Any] | None = None,
+    timeout_seconds: float = 300,
+    execution_guard: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for raw in checks:
+        if execution_guard is not None and not execution_guard():
+            results.append({"command": str(raw), "returncode": 125, "stdout": "",
+                            "stderr": "Protocol task lease lost before the next local check."})
+            break
         command = str(raw).strip()
         if not command:
             continue
@@ -6356,20 +5749,13 @@ def _run_local_checks(
             continue
         assertion = _parse_stdout_equals_check(command)
         if assertion is not None:
-            results.append(_run_stdout_equals_check(path, command, assertion[0], assertion[1]))
+            results.append(_run_stdout_equals_check(path, command, assertion[0], assertion[1], timeout_seconds=timeout_seconds))
             continue
         empty_command = _parse_stdout_empty_check(command)
         if empty_command is not None:
-            results.append(_run_stdout_empty_check(path, command, empty_command))
+            results.append(_run_stdout_empty_check(path, command, empty_command, timeout_seconds=timeout_seconds))
             continue
-        completed = subprocess.run(
-            command,
-            cwd=path,
-            shell=True,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = _run_local_check_command(path, command, timeout_seconds)
         results.append(
             {
                 "command": command,
@@ -6392,15 +5778,8 @@ def _parse_stdout_equals_check(command: str) -> tuple[str, str] | None:
     return left, expected
 
 
-def _run_stdout_equals_check(path: Path, original: str, command: str, expected: str) -> dict[str, Any]:
-    completed = subprocess.run(
-        command,
-        cwd=path,
-        shell=True,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+def _run_stdout_equals_check(path: Path, original: str, command: str, expected: str, *, timeout_seconds: float = 300) -> dict[str, Any]:
+    completed = _run_local_check_command(path, command, timeout_seconds)
     observed = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
     ok = completed.returncode == 0 and observed == expected
     return {
@@ -6421,15 +5800,8 @@ def _parse_stdout_empty_check(command: str) -> str | None:
     return inner or None
 
 
-def _run_stdout_empty_check(path: Path, original: str, command: str) -> dict[str, Any]:
-    completed = subprocess.run(
-        command,
-        cwd=path,
-        shell=True,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+def _run_stdout_empty_check(path: Path, original: str, command: str, *, timeout_seconds: float = 300) -> dict[str, Any]:
+    completed = _run_local_check_command(path, command, timeout_seconds)
     ok = completed.returncode == 0 and not completed.stdout.strip()
     return {
         "command": original,
@@ -6582,3 +5954,26 @@ def _wandb_metric_message(run_ref: WandbRunRef, state: str, snapshot: dict[str, 
     if metric_text:
         parts.append(metric_text)
     return "; ".join(parts) + "."
+
+
+def _execute_with_protocol_lease(
+    store: Store, project_name: str, experiment_name: str, contract: dict[str, Any], *,
+    protocol_task_id: int, owner: str | None, lease_seconds: int = 900, **kwargs: Any,
+) -> dict[str, Any]:
+    return _protocol._execute_with_protocol_lease(store, project_name, experiment_name, contract,
+        protocol_task_id=protocol_task_id, owner=owner, lease_seconds=lease_seconds,
+        executor=execute_execution_contract, **kwargs)
+
+
+def run_ready_experiment_tasks(
+    store: Store, project_name: str, experiment_name: str, *,
+    owner: str = "mycodex-protocol-worker", lease_seconds: int = 900, max_tasks: int = 1,
+    ssh_key: str | None = None, ssh_password_file: str | None = None,
+    remote_ref: str | None = None, remote_python: str | None = None,
+    allow_full_train: bool = False,
+) -> dict[str, Any]:
+    """Compatibility entrypoint; the task protocol receives an explicit executor."""
+    return _protocol.run_ready_experiment_tasks(store, project_name, experiment_name,
+        executor=execute_execution_contract, owner=owner, lease_seconds=lease_seconds,
+        max_tasks=max_tasks, ssh_key=ssh_key, ssh_password_file=ssh_password_file,
+        remote_ref=remote_ref, remote_python=remote_python, allow_full_train=allow_full_train)

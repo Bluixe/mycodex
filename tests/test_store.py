@@ -1031,7 +1031,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].provider, "zotero")
             self.assertEqual(results[0].title, "Adaptive LLM Reasoning")
-            self.assertTrue(results[0].pdf_url.endswith("storage/ATTACH1/paper.pdf"))
+            self.assertEqual(Path(results[0].pdf_url).resolve(), (storage / "paper.pdf").resolve())
 
     def test_telegram_users_and_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

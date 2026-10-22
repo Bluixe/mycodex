@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "license": "SQLite public-domain documentation",
+  "license_url": "https://www.sqlite.org/copyright.html",
+  "accessed_at": "2026-10-22T16:13:55.402116+00:00",
+  "research_question": "SQLite SQLITE_THREADSAFE serialized mutexing compile-time modes; WAL writer concurrency; online backup snapshot copying",
+  "sources": [
+    {
+      "id": "threading",
+      "title": "Using SQLite In Multi-Threaded Applications",
+      "url": "https://www.sqlite.org/threadsafe.html",
+      "section": "2. Compile-time selection of threading mode",
+      "evidence_marker": "critical mutexing logic is omitted",
+      "text": "The default mode is serialized.\nIf single-thread mode is selected at compile-time, then critical mutexing logic is omitted from the build and it is impossible to enable either multi-thread or serialized modes at start-time or run-time.",
+      "accessed_at": "2026-10-22T16:13:55.402116+00:00",
+      "raw_sha256": "b66b8962d118f07c5caf2653c094b98f5bc5ad949181efa6bc4e63ccc2f7fd90",
+      "excerpt_sha256": "511ee66befe48efe0534c501e504e6287fcfc4d3c28ea2faf283ffe2489c39fc"
+    },
+    {
+      "id": "wal",
+      "title": "Write-Ahead Logging",
+      "url": "https://www.sqlite.org/wal.html",
+      "section": "2.2. Concurrency",
+      "evidence_marker": "there can only be one writer at a time",
+      "text": "Writers merely append new content to the end of the WAL file.\nBecause writers do nothing that would interfere with the actions of readers, writers and readers can run at the same time.\nHowever, since there is only one WAL file, there can only be one writer at a time.",
+      "accessed_at": "2026-10-22T16:13:55.402116+00:00",
+      "raw_sha256": "f3467b530b883d4a00574fe1a898b3d121ed72764ae28cf66941080ac0badb9e",
+      "excerpt_sha256": "d7263d8f16d459e89ad693f46a2f8a738fe22492b7cb1ae9b1bb7939e34886f0"
+    },
+    {
+      "id": "backup",
+      "title": "SQLite Backup API",
+      "url": "https://www.sqlite.org/backup.html",
+      "section": "1. Using the SQLite Online Backup API",
+      "evidence_marker": "bit-wise identical copy of the source database",
+      "text": "The copy operation may be done incrementally, in which case the source database does not need to be locked for the duration of the copy, only for the brief periods of time when it is actually being read from.\nThe effect of completing the backup call sequence is to make the destination a bit-wise identical copy of the source database as it was when the copying commenced.",
+      "accessed_at": "2026-10-22T16:13:55.402116+00:00",
+      "raw_sha256": "306b6cca5c7c2f93b648040ae139f14d7d3221c0d16d79b5749e69d808382e04",
+      "excerpt_sha256": "82642ff501b5c5f07899d0ff2b66237954e84329b9a0a55fd9c755c28dfa6435"
+    }
+  ],
+  "questions": [
+    {
+      "id": "Q1",
+      "claim": "WAL permits more than one writer at a time because readers and writers run concurrently.",
+      "gold_status": "contradicted",
+      "gold_source_id": "wal",
+      "gold_answer": "WAL can overlap readers with a writer, but still allows only one writer at a time."
+    },
+    {
+      "id": "Q2",
+      "claim": "A build whose single-thread mode was selected at compile time can later enable serialized mode at run time.",
+      "gold_status": "contradicted",
+      "gold_source_id": "threading",
+      "gold_answer": "Compile-time single-thread mode omits critical mutexing code and cannot be upgraded at startup or run time."
+    },
+    {
+      "id": "Q3",
+      "claim": "Completing the online backup API sequence produces a destination snapshot, while incremental copying only briefly locks the source when reading it.",
+      "gold_status": "supported",
+      "gold_source_id": "backup",
+      "gold_answer": "The documentation specifies an identical snapshot and brief source locks during incremental reads."
+    },
+    {
+      "id": "Q4",
+      "claim": "The supplied sources prove that WAL is faster for every possible workload.",
+      "gold_status": "unknown",
+      "gold_source_id": null,
+      "gold_answer": "No supplied excerpt establishes a universal workload performance guarantee."
+    }
+  ]
+}

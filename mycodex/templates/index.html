@@ -45,6 +45,17 @@
       {% endif %}
     </div>
 
+    {% set insight = insight_reports.get(card.project.name) %}
+    <div class="insight-preview">
+      <a href="/insights?project={{ card.project.name|urlencode }}">项目洞察</a>
+      {% if insight and insight.report_id %}
+      <p>{{ insight.summary|truncate(150, true) }}</p>
+      {% if insight.source_changed %}<span class="badge warning">来源对话已有更新，请重新分析</span>{% elif insight.stale %}<span class="badge warning">需更新分析</span>{% endif %}
+      {% else %}
+      <p class="muted">待分析：尚未生成有来源的项目综述。</p>
+      {% endif %}
+    </div>
+
     <div class="actions">
       <form method="post" action="/projects/{{ card.project.name }}/sync">
         <button type="submit">Sync</button>

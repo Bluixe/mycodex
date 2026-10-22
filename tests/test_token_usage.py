@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from contextlib import closing
 
 from mycodex.db import Store
 from mycodex.token_usage import token_usage_snapshot
@@ -219,7 +220,7 @@ class TokenUsageTests(unittest.TestCase):
 
 
 def _init_logs_db(path: Path) -> None:
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE logs (
@@ -267,7 +268,7 @@ def _insert_usage_event(
             },
         },
     }
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute(
             """
             INSERT INTO logs (ts, target, feedback_log_body, process_uuid)
@@ -290,7 +291,7 @@ def _insert_metadata_event(
         fields.append(f"thread.id={thread_id}")
     if cwd is not None:
         fields.append(f"cwd={cwd}")
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute(
             """
             INSERT INTO logs (ts, target, feedback_log_body, thread_id, process_uuid)
@@ -301,7 +302,7 @@ def _insert_metadata_event(
 
 
 def _delete_usage_events(path: Path) -> None:
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("DELETE FROM logs WHERE target = 'codex_api::sse::responses'")
 
 

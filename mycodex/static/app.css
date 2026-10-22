@@ -768,3 +768,42 @@ td p {
     grid-template-columns: 1fr;
   }
 }
+
+/* Conversation insights keep evidence and editable feedback readable. */
+.insight-stack { display: grid; gap: 20px; margin-top: 20px; }
+.insight-refresh, .insight-report, .profile-notice, .profile-item, .evidence-message { padding: 20px; }
+.insight-refresh form { display: grid; gap: 12px; justify-items: start; }
+.insight-project-picker { border: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; padding: 14px; }
+.insight-project-picker legend { color: var(--muted); font-size: 12px; }
+.insight-preview { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
+.insight-preview p { margin: 6px 0; overflow-wrap: anywhere; }
+.insight-preview .badge, .insight-report > .badge { white-space: normal; line-height: 1.5; }
+.insight-summary { font-size: 16px; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
+.insight-description { display: grid; gap: 16px; margin: 20px 0; }
+.insight-description dd { white-space: pre-wrap; }
+.insight-columns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
+.insight-columns h3, .insight-assessment h3 { font-size: 14px; margin-bottom: 8px; }
+.insight-columns ul { padding-left: 20px; }
+.insight-columns li { margin: 8px 0; overflow-wrap: anywhere; }
+.insight-assessment { border-left: 3px solid var(--line); padding: 1px 16px; margin: 16px 0; }
+.insight-assessment p { white-space: pre-wrap; }
+.citation-links { display: inline-flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; }
+.report-citations { margin: 18px 0; }
+.coverage-details, .fact-details, .profile-edit { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
+summary { cursor: pointer; }
+.coverage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.coverage-grid dd { overflow-wrap: anywhere; }
+.insight-facts { list-style: none; padding: 0; }
+.insight-facts li { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.insight-facts p { overflow-wrap: anywhere; }
+.profile-actions { flex-wrap: wrap; }
+.profile-quote { border-left: 3px solid var(--line); color: var(--muted); margin: 12px 0; padding: 4px 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.profile-edit form { display: grid; gap: 10px; margin-top: 12px; justify-items: start; }
+.profile-edit textarea { width: 100%; max-width: 800px; min-height: 100px; }
+.insight-text { background: #eef1f5; padding: 16px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; }
+@media (max-width: 900px) {
+  .topbar { flex-wrap: wrap; gap: 12px; padding: 16px; }
+  .topnav { flex-wrap: wrap; }
+  .insight-columns, .coverage-grid { grid-template-columns: 1fr; }
+  .insight-report .section-head, .profile-item .section-head { display: grid; }
+}

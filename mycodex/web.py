@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -20,6 +21,8 @@ from .status import (
     snapshot_to_jsonable,
 )
 from .token_usage import token_usage_snapshot
+from .jobs import JobQueue
+from .diagnostics import decision_snapshot
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -33,18 +36,28 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app.state.db_path = resolved_db_path
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    @app.middleware("http")
+    async def same_origin_mutations(request: Request, call_next):
+        origin = request.headers.get("origin")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc != request.headers.get("host"):
+                return JSONResponse({"error": "cross-origin mutations are not allowed"}, status_code=403)
+        return await call_next(request)
+
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.filters["ts"] = format_ts
     templates.env.filters["schedule"] = rule_schedule_label
     templates.env.filters["priority"] = _priority_label
     templates.env.filters["compact_int"] = _compact_int
     templates.env.filters["format_int"] = _format_int
+    templates.env.filters["local_iso"] = _local_iso_time
 
     def render(request: Request, template: str, context: dict[str, Any]) -> HTMLResponse:
         base_context = {
             "request": request,
             "db_path": str(resolved_db_path),
-            "assets_version": "20260515-daily-summary-notify",
+            "assets_version": "20261023-insights",
         }
         base_context.update(context)
         return templates.TemplateResponse(request, template, base_context)
@@ -53,15 +66,106 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def index(request: Request):
         with Store(resolved_db_path) as store:
             snapshot = snapshot_to_jsonable(dashboard_snapshot(store))
+            insight_reports = {report["project_name"]: report
+                              for report in _insights(store).overview()["projects"]}
         return render(
             request,
             "index.html",
             {
                 "snapshot": snapshot,
+                "insight_reports": insight_reports,
                 "page_title": "Projects",
                 "refresh_interval_ms": 20000,
             },
         )
+
+    @app.get("/insights", response_class=HTMLResponse)
+    def insights_page(request: Request, project: str | None = None):
+        with Store(resolved_db_path) as store:
+            service = _insights(store)
+            if project is not None:
+                if store.get_project(project) is None:
+                    return JSONResponse({"error": "unknown project"}, status_code=404)
+                overview = service.overview()
+                reports = [service.project_report(project)]
+            else:
+                overview = service.overview()
+                reports = overview["projects"]
+        return render(request, "insights.html", {"page_title": "项目洞察", "overview": overview,
+            "reports": reports, "selected_project": project, "refresh_interval_ms": 0})
+
+    @app.get("/profile", response_class=HTMLResponse)
+    def profile_page(request: Request, include_inactive: bool = False):
+        with Store(resolved_db_path) as store:
+            profile = _insights(store).profile(include_inactive=include_inactive)
+        return render(request, "profile.html", {"page_title": "用户画像", "profile": profile,
+            "include_inactive": include_inactive, "refresh_interval_ms": 0})
+
+    @app.get("/api/insights")
+    def api_insights(project: str | None = None):
+        with Store(resolved_db_path) as store:
+            service = _insights(store)
+            if project is not None:
+                if store.get_project(project) is None:
+                    return JSONResponse({"error": "unknown project"}, status_code=404)
+                return JSONResponse(service.project_report(project))
+            return JSONResponse(service.overview())
+
+    @app.get("/api/profile")
+    def api_profile(include_inactive: bool = False):
+        with Store(resolved_db_path) as store:
+            return JSONResponse(_insights(store).profile(include_inactive=include_inactive))
+
+    @app.get("/api/conversations/messages/{message_id}")
+    def api_conversation_message(message_id: int):
+        with Store(resolved_db_path) as store:
+            message = _insights(store).evidence(message_id)
+        return JSONResponse(message if message is not None else {"error": "unknown message"},
+                            status_code=200 if message is not None else 404)
+
+    @app.get("/conversations/messages/{message_id}", response_class=HTMLResponse)
+    def conversation_message(request: Request, message_id: int):
+        with Store(resolved_db_path) as store:
+            message = _insights(store).evidence(message_id)
+        if message is None:
+            return JSONResponse({"error": "unknown message"}, status_code=404)
+        return render(request, "evidence.html", {"page_title": f"对话来源 #{message_id}",
+            "message": message, "message_id": message_id, "refresh_interval_ms": 0})
+
+    @app.post("/insights/refresh")
+    async def refresh_insights(request: Request):
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        project_names = list(dict.fromkeys(name.strip() for name in form.get("project_names", []) if name.strip()))
+        if len(project_names) > 20:
+            return JSONResponse({"error": "at most 20 projects may be selected"}, status_code=400)
+        with Store(resolved_db_path) as store:
+            if any(store.get_project(name) is None for name in project_names):
+                return JSONResponse({"error": "unknown project"}, status_code=404)
+            try:
+                _submit_insight_refresh(store, project_names=project_names or None)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+        return _redirect("/jobs")
+
+    @app.post("/profile/{item_id}/{action}")
+    async def update_profile_item(item_id: int, action: str, request: Request):
+        if action not in {"confirm", "reject", "correct", "forget"}:
+            return JSONResponse({"error": "unknown profile action"}, status_code=404)
+        form = await _read_form(request)
+        text = form.get("text", "").strip()
+        if action == "correct" and (not text or len(text) > 2000):
+            return JSONResponse({"error": "correction text must contain 1 to 2000 characters"}, status_code=400)
+        with Store(resolved_db_path) as store:
+            try:
+                item = _insights(store).update_profile(item_id, action=action, text=text)
+            except LookupError:
+                return JSONResponse({"error": "unknown profile item"}, status_code=404)
+            except ValueError as exc:
+                status = 404 if "unknown" in str(exc).lower() or "not found" in str(exc).lower() else 400
+                return JSONResponse({"error": str(exc)}, status_code=status)
+        if item is None:
+            return JSONResponse({"error": "unknown profile item"}, status_code=404)
+        return _redirect("/profile")
 
     @app.get("/projects/{project_name}", response_class=HTMLResponse)
     def project_detail(request: Request, project_name: str):
@@ -114,13 +218,15 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.post("/projects/{project_name}/sync")
     def sync_project(project_name: str, background_tasks: BackgroundTasks):
-        background_tasks.add_task(_sync_project_task, resolved_db_path, project_name)
-        return _redirect(f"/projects/{project_name}")
+        with Store(resolved_db_path) as store:
+            JobQueue(store).submit(project_name, "sync_sessions", source="web")
+        return _redirect("/jobs")
 
     @app.post("/projects/{project_name}/daily-summary")
     def daily_summary(project_name: str, background_tasks: BackgroundTasks):
-        background_tasks.add_task(_daily_summary_task, resolved_db_path, project_name)
-        return _redirect(f"/projects/{project_name}")
+        with Store(resolved_db_path) as store:
+            JobQueue(store).submit(project_name, "daily_summary", source="web")
+        return _redirect("/jobs")
 
     @app.post("/projects/{project_name}/send")
     async def send_project_prompt(
@@ -131,14 +237,97 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         form = await _read_form(request)
         prompt = form.get("prompt", "").strip()
         if prompt:
-            background_tasks.add_task(
-                _send_prompt_task,
-                resolved_db_path,
-                project_name,
-                prompt,
-                form.get("new_thread") == "on",
-            )
-        return _redirect(f"/projects/{project_name}")
+            with Store(resolved_db_path) as store:
+                JobQueue(store).submit(project_name, "prompt",
+                    {"prompt": prompt, "new_thread": form.get("new_thread") == "on"}, source="web")
+        return _redirect("/jobs")
+
+    @app.get("/jobs", response_class=HTMLResponse)
+    def jobs_page(request: Request, project: str | None = None):
+        with Store(resolved_db_path) as store:
+            jobs = JobQueue(store).list(project)
+            projects = [dict(row) for row in store.list_projects()]
+            decisions = [decision_snapshot(store, row["name"]) for row in projects]
+        return render(request, "jobs.html", {"jobs": jobs, "decisions": decisions,
+            "page_title": "Tasks and decisions", "refresh_interval_ms": 0})
+
+    @app.get("/api/jobs")
+    def api_jobs(project: str | None = None):
+        with Store(resolved_db_path) as store:
+            return JSONResponse(JobQueue(store).list(project))
+
+    @app.get("/api/jobs/{job_id}")
+    def api_job(job_id: int):
+        with Store(resolved_db_path) as store:
+            queue = JobQueue(store)
+            job = queue.get(job_id)
+            return JSONResponse({"job": job, "events": queue.events(job_id)}, status_code=200 if job else 404)
+
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel_job(job_id: int):
+        with Store(resolved_db_path) as store:
+            if JobQueue(store).get(job_id) is None:
+                return JSONResponse({"error": "unknown job"}, status_code=404)
+            JobQueue(store).cancel(job_id)
+        return _redirect("/jobs")
+
+    @app.post('/jobs/{job_id}/{action}')
+    async def control_job(job_id: int, action: str, request: Request):
+        if action not in {'pause','resume','revise'}:
+            return JSONResponse({'error': 'unknown action'}, status_code=404)
+        form = await _read_form(request)
+        with Store(resolved_db_path) as store:
+            queue = JobQueue(store)
+            if queue.get(job_id) is None:
+                return JSONResponse({'error': 'unknown job'}, status_code=404)
+            try:
+                if action == 'pause':
+                    queue.pause(job_id)
+                elif action == 'resume':
+                    queue.resume(job_id, expected_revision=int(form['revision']) if 'revision' in form else None)
+                else:
+                    queue.revise(job_id, form.get('prompt'), expected_revision=int(form.get('revision', '-1')))
+            except (ValueError, TypeError) as exc:
+                return JSONResponse({'error': str(exc)}, status_code=409)
+        return _redirect('/jobs')
+
+    @app.get('/api/jobs/{job_id}/trace')
+    def api_trace(job_id: int):
+        from .tracing import job_trace
+        with Store(resolved_db_path) as store:
+            try:
+                return JSONResponse(job_trace(store, job_id))
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=404)
+
+    @app.get('/api/reviews/{workflow_id}')
+    def api_review(workflow_id: int):
+        from .review_workflow import workflow_report
+        with Store(resolved_db_path) as store:
+            try:
+                return JSONResponse(workflow_report(store, workflow_id))
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=404)
+
+    @app.get("/api/projects/{project_name}/decisions")
+    def api_decisions(project_name: str):
+        with Store(resolved_db_path) as store:
+            if store.get_project(project_name) is None:
+                return JSONResponse({"error": "unknown project"}, status_code=404)
+            return JSONResponse(decision_snapshot(store, project_name))
+
+    @app.get("/api/projects/{project_name}/research/{research_name}/evidence")
+    def api_evidence(project_name: str, research_name: str, query: str | None = None):
+        from .research_evidence import EvidenceLedger
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            research = store.get_research_thread(project["id"], research_name) if project else None
+            if research is None:
+                return JSONResponse({"error": "unknown research"}, status_code=404)
+            ledger = EvidenceLedger(store)
+            return JSONResponse({"passages": ledger.search_evidence(research["id"], query or research["question"]),
+                                 "links": ledger.list_evidence(research["id"]),
+                                 "coverage": ledger.list_search_receipts(research["id"])})
 
     @app.post("/projects/{project_name}/todos")
     async def create_todo(project_name: str, request: Request):
@@ -324,6 +513,29 @@ async def _read_form(request: Request) -> dict[str, str]:
     body = (await request.body()).decode("utf-8")
     parsed = parse_qs(body, keep_blank_values=True)
     return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _insights(store: Store):
+    from .insights import Insights
+    return Insights(store)
+
+
+def _submit_insight_refresh(store: Store, *, project_names: list[str] | None):
+    from .insight_tasks import submit_insight_refresh
+    return submit_insight_refresh(store, project_names=project_names)
+
+
+def _local_iso_time(value: Any) -> str:
+    """Display a timezone-aware source time locally without guessing its zone."""
+    if not isinstance(value, str) or not value.strip():
+        return "时间未知"
+    try:
+        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            return "时间未知（来源未提供时区）"
+        return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (ValueError, OverflowError, OSError):
+        return "时间未知"
 
 
 def _redirect(path: str) -> RedirectResponse:

@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from .codex_app import CodexAppServerClient
+from .contracts import (
+    ContractValidationError,
+    contract_schema_for_kind,
+    native_output_schema,
+    normalize_native_contract,
+    parse_contract,
+    validate_contract,
+)
 from .db import Store
 from .prompts import (
     daily_summary_prompt,
@@ -17,6 +27,14 @@ from .prompts import (
     experiment_peer_review_prompt,
     research_control_prompt,
 )
+
+
+def _runtime_client():
+    # Preserve the native constructor seam for existing integrations and tests.
+    if os.environ.get('MYCODEX_RUNTIME_BACKEND', 'app-server') == 'app-server':
+        return CodexAppServerClient()
+    from .runtime_adapters import create_runtime_client
+    return create_runtime_client()
 
 
 VALID_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
@@ -68,7 +86,7 @@ def sync_sessions(
     use_state_db_only: bool = True,
 ) -> list[dict[str, Any]]:
     project = require_project(store, project_name)
-    with CodexAppServerClient() as client:
+    with _runtime_client() as client:
         threads = client.list_threads(
             cwd=project["path"],
             limit=limit,
@@ -98,6 +116,10 @@ def send_prompt(
     reasoning_effort: str | None = None,
     update_default_thread: bool = True,
     event_callback: Callable[[dict[str, Any]], None] | None = None,
+    output_schema: dict[str, Any] | None = None,
+    cancellation_callback: Callable[[], bool] | None = None,
+    usage_callback: Callable[[dict[str, Any]], bool | None] | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     project = require_project(store, project_name)
     if sync_first:
@@ -117,10 +139,21 @@ def send_prompt(
     chosen_approval = ensure_valid_approval_policy(approval_policy or project["approval_policy"])
     chosen_model = model or project["model"]
     chosen_effort = reasoning_effort or project["reasoning_effort"]
+    chosen_schema = output_schema if output_schema is not None else contract_schema_for_kind(kind)
+    trace_id = trace_id or uuid.uuid4().hex
 
     run_id = store.add_run(project["id"], kind=kind, prompt=prompt, thread_id=chosen_thread_id)
+    operation_deadline = time.monotonic() + timeout
     try:
-        with CodexAppServerClient() as client:
+        if cancellation_callback is not None and cancellation_callback():
+            store.finish_run(run_id, status="cancelled", error="cancelled before Codex startup",
+                             raw_json={"trace_id": trace_id}, thread_id=chosen_thread_id)
+            return {"run_id": run_id, "thread_id": chosen_thread_id, "turn_id": None,
+                    "status": "cancelled", "output_text": "", "token_usage": {},
+                    "trace_id": trace_id, "error": "cancelled before Codex startup", 'not_started': True}
+        runtime = _runtime_client()
+        runtime.operation_deadline = operation_deadline
+        with runtime as client:
             thread = client.start_or_resume_thread(
                 thread_id=chosen_thread_id,
                 cwd=project["path"],
@@ -133,6 +166,19 @@ def send_prompt(
             store.upsert_session(project["id"], thread)
             if update_default_thread:
                 store.update_default_thread(project["id"], chosen_thread_id)
+            # No SQLite write transaction may span a model call, including
+            # isolated reviews that do not change the default thread.
+            store.commit()
+            if cancellation_callback is not None and cancellation_callback():
+                store.finish_run(run_id, status='cancelled', error='cancelled before turn start',
+                                 raw_json={'trace_id':trace_id, 'not_started':True}, thread_id=chosen_thread_id)
+                return {'run_id':run_id, 'thread_id':chosen_thread_id, 'turn_id':None,
+                        'status':'cancelled', 'output_text':'', 'token_usage':{}, 'trace_id':trace_id,
+                        'error':'cancelled before turn start', 'not_started':True}
+            # User-provided schemas are already wire schemas; only our versioned
+            # extension-friendly contracts require strict-subset compilation.
+            wire_schema = native_output_schema(chosen_schema) if chosen_schema is not None and output_schema is None else chosen_schema
+            turn_options = {"output_schema": wire_schema} if wire_schema is not None else {}
             turn_id, turn = client.start_turn(
                 thread_id=chosen_thread_id,
                 prompt=prompt,
@@ -140,19 +186,56 @@ def send_prompt(
                 approval_policy=chosen_approval,
                 model=chosen_model,
                 reasoning_effort=chosen_effort,
+                **turn_options,
             )
+            wait_options = {}
+            if cancellation_callback is not None:
+                wait_options["cancellation_callback"] = cancellation_callback
+            if usage_callback is not None:
+                wait_options["usage_callback"] = usage_callback
             result = client.wait_for_turn(
                 thread_id=chosen_thread_id,
                 turn_id=turn_id,
-                timeout=timeout,
+                timeout=max(0, operation_deadline - time.monotonic()),
                 on_event=event_callback,
+                **wait_options,
             )
-            status = "completed" if result.completed else "timeout"
-            raw = {"thread": thread, "turn": turn, "result": result.raw}
+            status = getattr(result, "status", "unknown")
+            if status == "unknown":
+                status = "completed" if result.completed else "timeout"
+            token_usage = getattr(result, "token_usage", {})
+            raw = {"thread": thread, "turn": turn, "result": result.raw,
+                   "trace_id": trace_id, "token_usage": token_usage}
+            output_text = result.output_text
+            validation_error = ""
+            if status == "completed" and chosen_schema is not None:
+                try:
+                    contract = parse_contract(output_text)
+                    if output_schema is None:
+                        contract = normalize_native_contract(contract, chosen_schema)
+                    validate_contract(contract, chosen_schema)
+                    raw["validated_contract"] = contract
+                    raw["contract_schema"] = chosen_schema.get("title", "custom")
+                    raw["native_output_text"] = output_text
+                    output_text = json.dumps(contract, ensure_ascii=False)
+                except ContractValidationError as exc:
+                    status = "failed"
+                    validation_error = str(exc)
+                    raw["contract_validation_error"] = validation_error
+            error = validation_error or result.raw.get("stop_reason", "")
+            if status != "completed":
+                # Keep diagnostics in durable run state, never expose a partial
+                # executable contract to legacy callers that only parse text.
+                raw["diagnostic_output_text"] = output_text
+                output_text = ""
+                if not error:
+                    errors = result.raw.get("errors") or []
+                    error = json.dumps(errors, ensure_ascii=False) if errors else f"Codex turn ended with status {status}"
             store.finish_run(
                 run_id,
                 status=status,
-                output_text=result.output_text,
+                output_text=output_text,
+                error=error,
                 raw_json=raw,
                 thread_id=chosen_thread_id,
             )
@@ -161,13 +244,20 @@ def send_prompt(
                 "thread_id": chosen_thread_id,
                 "turn_id": turn_id,
                 "status": status,
-                "output_text": result.output_text,
+                "output_text": output_text,
+                "token_usage": token_usage,
+                "trace_id": trace_id,
+                "error": error,
+                "contract_validation_error": validation_error,
+                "interruption_confirmed": result.raw.get('interruption_confirmed') is True,
+                "terminal_confirmed": result.raw.get('terminal_confirmed') is True,
             }
-    except Exception as exc:
+    except BaseException as exc:
         store.finish_run(
             run_id,
-            status="failed",
+            status="cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",
             error=str(exc),
+            raw_json={"trace_id": trace_id},
             thread_id=chosen_thread_id,
         )
         raise
@@ -666,7 +756,7 @@ def start_research_control_turn(
         phase="waiting_for_decision",
         phase_message="Research control analysis completed; applying contract if available.",
     )
-    contract = extract_research_contract(result.get("output_text") or "")
+    contract = extract_research_contract(result.get("output_text") or "") if result["status"] == "completed" else None
     if contract is None:
         store.add_research_event(
             research["id"],

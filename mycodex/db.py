@@ -375,6 +375,9 @@ class Store:
         self._ensure_column("experiments", "artifact_ref", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("rules", "thread_id", "TEXT")
         self.conn.commit()
+        from .jobs import initialize_job_schema
+
+        initialize_job_schema(self.conn)
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -1036,7 +1039,7 @@ class Store:
                 task_id = int(cur.lastrowid)
             else:
                 task_id = int(existing["id"])
-                if existing["status"] not in EXPERIMENT_TASK_TERMINAL_STATUSES:
+                if existing["status"] in {"proposed", "ready"}:
                     self.conn.execute(
                         """
                         UPDATE experiment_tasks
@@ -1058,7 +1061,7 @@ class Store:
                                 WHEN ? IN ('succeeded', 'failed', 'blocked', 'cancelled') THEN COALESCE(completed_at, ?)
                                 ELSE NULL
                             END
-                        WHERE id = ?
+                        WHERE id = ? AND status IN ('proposed', 'ready')
                         """,
                         (
                             task_type,
@@ -1142,36 +1145,23 @@ class Store:
         try:
             task = self.conn.execute(
                 """
-                SELECT *
-                FROM experiment_tasks
-                WHERE experiment_id = ?
-                  AND attempts < max_attempts
-                  AND (
-                    status = 'ready'
-                    OR (status = 'leased' AND COALESCE(lease_expires_at, 0) <= ?)
-                  )
-                ORDER BY ready_at ASC, created_at ASC, id ASC
-                LIMIT 1
-                """,
-                (experiment_id, ts),
-            ).fetchone()
-            if task is None:
-                return None
-            self.conn.execute(
-                """
                 UPDATE experiment_tasks
-                SET status = 'leased',
-                    lease_owner = ?,
-                    lease_expires_at = ?,
-                    attempts = attempts + 1,
-                    updated_at = ?,
+                SET status = 'leased', lease_owner = ?, lease_expires_at = ?,
+                    attempts = attempts + 1, updated_at = ?,
                     started_at = COALESCE(started_at, ?)
-                WHERE id = ?
+                WHERE id = (
+                    SELECT id FROM experiment_tasks
+                    WHERE experiment_id = ? AND attempts < max_attempts
+                      AND (status = 'ready' OR
+                           (status = 'leased' AND COALESCE(lease_expires_at, 0) <= ?))
+                    ORDER BY ready_at ASC, created_at ASC, id ASC LIMIT 1
+                )
+                RETURNING *
                 """,
-                (owner, ts + lease_seconds, ts, ts, task["id"]),
-            )
+                (owner, ts + lease_seconds, ts, ts, experiment_id, ts),
+            ).fetchone()
             self.conn.commit()
-            return self.get_experiment_task(experiment_id, int(task["id"]))
+            return task
         except Exception:
             self.conn.rollback()
             raise
@@ -1194,8 +1184,10 @@ class Store:
         try:
             task = self.conn.execute(
                 """
-                SELECT *
-                FROM experiment_tasks
+                UPDATE experiment_tasks
+                SET status = 'leased', lease_owner = ?, lease_expires_at = ?,
+                    attempts = attempts + 1, updated_at = ?,
+                    started_at = COALESCE(started_at, ?)
                 WHERE experiment_id = ?
                   AND id = ?
                   AND attempts < max_attempts
@@ -1203,27 +1195,76 @@ class Store:
                     status = 'ready'
                     OR (status = 'leased' AND COALESCE(lease_expires_at, 0) <= ?)
                   )
-                LIMIT 1
+                RETURNING *
                 """,
-                (experiment_id, task_id, ts),
+                (owner, ts + lease_seconds, ts, ts, experiment_id, task_id, ts),
             ).fetchone()
-            if task is None:
-                return None
-            self.conn.execute(
-                """
-                UPDATE experiment_tasks
-                SET status = 'leased',
-                    lease_owner = ?,
-                    lease_expires_at = ?,
-                    attempts = attempts + 1,
-                    updated_at = ?,
-                    started_at = COALESCE(started_at, ?)
-                WHERE id = ?
-                """,
-                (owner, ts + lease_seconds, ts, ts, task_id),
-            )
             self.conn.commit()
-            return self.get_experiment_task(experiment_id, task_id)
+            return task
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def renew_experiment_task_lease(
+        self, experiment_id: int, task_id: int, *, owner: str,
+        lease_seconds: int = 900, now: int | None = None,
+    ) -> bool:
+        if not owner.strip() or lease_seconds < 1:
+            raise ValueError("owner and positive lease duration are required")
+        ts = now_ts() if now is None else int(now)
+        cursor = self.conn.execute("""UPDATE experiment_tasks SET lease_expires_at=?,updated_at=?
+            WHERE experiment_id=? AND id=? AND lease_owner=?
+              AND status IN ('leased','running') AND lease_expires_at>?""",
+            (ts + lease_seconds, ts, experiment_id, task_id, owner, ts))
+        self.conn.commit()
+        return bool(cursor.rowcount)
+
+    def start_experiment_task_if_owned(
+        self, experiment_id: int, task_id: int, *, owner: str,
+        now: int | None = None,
+    ) -> sqlite3.Row | None:
+        """Start only the current, unexpired lease acquisition."""
+        if not owner.strip():
+            raise ValueError("experiment task lease owner is required")
+        ts = now_ts() if now is None else int(now)
+        try:
+            task = self.conn.execute("""UPDATE experiment_tasks
+                SET status='running', updated_at=?, started_at=COALESCE(started_at,?)
+                WHERE experiment_id=? AND id=? AND lease_owner=?
+                  AND status='leased' AND lease_expires_at>?
+                RETURNING *""", (ts, ts, experiment_id, task_id, owner, ts)).fetchone()
+            self.conn.commit()
+            return task
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def complete_experiment_task_if_owned(
+        self, experiment_id: int, task_id: int, status: str, *, owner: str,
+        result: dict[str, Any] | None = None, error: str = "",
+        now: int | None = None,
+    ) -> sqlite3.Row | None:
+        """Fence terminal writes against expired or reassigned leases."""
+        status = _validate_experiment_task_status(status)
+        if status not in EXPERIMENT_TASK_TERMINAL_STATUSES:
+            raise ValueError("owned completion requires a terminal task status")
+        if not owner.strip():
+            raise ValueError("experiment task lease owner is required")
+        ts = now_ts() if now is None else int(now)
+        try:
+            task = self.conn.execute("""UPDATE experiment_tasks
+                SET status=?, updated_at=?, completed_at=COALESCE(completed_at,?),
+                    result_json=COALESCE(?,result_json), error=?,
+                    lease_owner='', lease_expires_at=NULL
+                WHERE experiment_id=? AND id=? AND lease_owner=?
+                  AND status IN ('leased','running') AND lease_expires_at>?
+                RETURNING *""", (
+                    status, ts, ts,
+                    json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
+                    error.strip(), experiment_id, task_id, owner, ts,
+                )).fetchone()
+            self.conn.commit()
+            return task
         except Exception:
             self.conn.rollback()
             raise
@@ -1657,8 +1698,6 @@ class Store:
             ),
         )
         self.conn.commit()
-        if cur.lastrowid:
-            return int(cur.lastrowid)
         row = self.conn.execute(
             "SELECT id FROM research_sources WHERE research_id = ? AND url = ?",
             (research_id, url),
@@ -1758,6 +1797,8 @@ class Store:
         if not claim:
             raise ValueError("research claim is required")
         status = _validate_research_claim_status(status)
+        metadata = dict(metadata or {})
+        metadata.setdefault("verification_status", "legacy_unverified" if status in {"supported", "contradicted"} else "unverified")
         ts = now_ts()
         cur = self.conn.execute(
             """

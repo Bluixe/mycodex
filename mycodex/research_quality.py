@@ -478,10 +478,12 @@ def synthesize_ledgers(
         claims.append(
             {
                 "claim": template["claim"],
-                "status": template.get("status", "uncertain"),
-                "support": "; ".join(source_titles[:3]),
-                "confidence": 3 if source_titles else 1,
-                "metadata": {"generated_by": "local_synthesis", "profile": profile.key},
+                "status": "uncertain",
+                "support": "",
+                "confidence": 0,
+                "notes": "Heuristic candidate; requires passage-level verification before use as evidence.",
+                "metadata": {"generated_by": "local_synthesis", "profile": profile.key,
+                             "verification_status": "unverified", "candidate_source_ids": []},
             }
         )
 
@@ -489,7 +491,7 @@ def synthesize_ledgers(
     for template in profile.idea_templates[:max_ideas]:
         novelty = _novelty_assessment(template, top_sources)
         score = {
-            "evidence": min(5, 2 + len(source_titles[:3])),
+            "evidence": 0,
             "novelty": novelty["score"],
             "feasibility": 4 if "High" in template.get("feasibility", "") else 3,
             "project_fit": 3,
@@ -510,6 +512,7 @@ def synthesize_ledgers(
                 ),
                 "metadata": {
                     "generated_by": "local_synthesis",
+                    "verification_status": "unverified",
                     "profile": profile.key,
                     "nearest_threats": novelty["nearest_threats"],
                     "source_titles": source_titles[:6],
@@ -592,6 +595,8 @@ def critique_idea(
     threat_sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     profile = infer_topic_profile(question)
+    metadata = idea.get('metadata') if isinstance(idea.get('metadata'), dict) else {}
+    search_coverage = metadata.get('threat_search_coverage', 'unknown')
     threats = threat_sources or _nearest_threat_sources(idea, sources)
     threat_titles = [str(source.get("title") or "") for source in threats[:6]]
     idea_text = " ".join(
@@ -603,6 +608,8 @@ def critique_idea(
         default=0.0,
     )
     novelty = 4 if not threats else 3 if overlap < 0.22 else 2
+    if search_coverage != 'complete_requested':
+        novelty = 0  # Unknown; missing coverage is not positive novelty evidence.
     feasibility = _idea_feasibility_score(idea)
     falsifiability = 4 if idea.get("minimal_test") and idea.get("kill_criteria") else 2
     evidence = min(5, 2 + len([source for source in sources if source.get("status") != "rejected"][:3]))
@@ -614,6 +621,8 @@ def critique_idea(
         status = "rejected"
     else:
         status = "candidate"
+    if search_coverage != 'complete_requested':
+        status = 'candidate'  # Availability failures must not reject the idea either.
     critique = {
         "profile": profile.key,
         "status": status,
@@ -627,6 +636,9 @@ def critique_idea(
             "total": total,
         },
         "nearest_threats": threat_titles,
+        "verification_status": "heuristic_unverified",
+        "search_coverage": search_coverage,
+        "novelty_assessment": 'unknown_coverage_incomplete' if search_coverage != 'complete_requested' else 'heuristic',
         "risks": _idea_risks(idea, threats),
         "refinement": _idea_refinement(idea, profile, threat_titles),
         "notes": _idea_critique_notes(idea, threat_titles, novelty, feasibility, falsifiability, total),

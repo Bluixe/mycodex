@@ -13,6 +13,54 @@ pitfalls that should be easy to update.
   It can start or resume threads, then records the run result locally.
 
 ## Durable Decisions
+- Version 0.3 sends/summaries always persist jobs; the CLI consumes immediately
+  unless `--enqueue` saves only. Pause requires a confirmed interrupted terminal
+  event, not just an interrupt RPC acknowledgement. Ambiguous effects stay
+  blocked. Resume preserves the thread and cumulative budget; unknown prior
+  token usage cannot become a fabricated zero. Goal edits preserve authority
+  and use optimistic revisions. Session-index writes must commit before model
+  calls so independent reviews do not hold the SQLite writer lock.
+- Task deadlines include setup RPCs and turn waiting, with separate bounded
+  interrupt/cleanup grace. A completed turn that overshoots its observed token
+  limit remains completed in the runtime record while its queue job blocks
+  dependent automatic work. Usage-based limits cannot undo input already billed.
+- The optional pinned SDK transport shares fail-closed lifecycle parsing and
+  explicitly declines approval requests; select with MYCODEX_RUNTIME_BACKEND=sdk.
+  Native app-server remains the default. The PDF documents extra uses bounded
+  subprocess extraction; headings/tables/numbered formulas are located candidates,
+  not semantically verified research evidence.
+- Review routing uses explicit risk flags and persists its reason. Cost is actual
+  reported usage or unknown. Accepted owner-verified findings are distinct from
+  net savings, which require a paired baseline. OTLP exports contain metadata
+  only, correlate all matching run attempts, and flag event truncation.
+- Operational benchmarks distinguish constructed faults, retained historical
+  traces and real material/model tasks. The first small SQLite recency-stress
+  pair measures source-context coverage, not general scientific reasoning.
+  Unavailable refs/capabilities and skipped integrations never count as passes.
+- Version 0.2 adds `jobs` as the durable queue for web, Telegram, and scheduled
+  work. Submission freezes runtime permissions and thread selection. Expired
+  unstarted leases can be retried; expired running leases are blocked for
+  inspection. Writes in the same project and turns in the same thread serialize.
+- Native JSON output schemas are normalized into versioned contracts and then
+  type/policy checked. A failed/interrupted turn or invalid contract must never
+  be treated as a successful executable plan. Prefer `MYCODEX_CODEX_BIN`, or the
+  valid desktop `CODEX_CLI_PATH`, over a stale PATH runtime; never rewrite global
+  user configuration to accommodate an old binary.
+- Research source versions/passages are immutable. Provider failures are coverage
+  gaps, not negative evidence. Template claims remain uncertain; passage-linked
+  verification records are required for promotion. Retrieval is lexical and
+  locators remain unknown when extraction cannot establish a page or section.
+- Managed remote execution uses a stable execution ID, an atomic claim,
+  persistent receipts, numeric time budgets, and immutable local manifests.
+  Repeating an execution ID observes the existing run. A result gate records
+  artifact/receipt consistency separately from scientific validity. Lease
+  ownership must be renewed and atomically fenced at start and completion.
+- MCP is a local STDIO interface and read-only by default. Optional writes submit
+  or cancel bounded jobs and cannot enlarge project permissions. Bounded review
+  workflows use independent read-only threads; their proposals grant no new
+  authority. Recorded-run evaluation is a consistency check, not a scientific
+  quality benchmark. SDK, embedding, and external tracing integrations remain
+  optional future work as of 0.2; 0.3 adds the opt-in SDK and trace exporter.
 - Do not write directly to Codex internal automation tables.
 - For self-iterating experiments, the bound Codex session should not write
   `mycodex` SQLite directly or call `mycodex experiments event` itself. The

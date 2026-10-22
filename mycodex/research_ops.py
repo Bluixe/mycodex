@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .db import Store
-from .research_connectors import ingest_text_source, search_public_sources
+from .research_connectors import _redact_sensitive, ingest_text_source, search_public_sources
+from .research_documents import document_summary
+from .research_evidence import EvidenceLedger
 from .research_quality import (
     build_concept_preflight,
     coverage_summary,
@@ -124,15 +126,27 @@ def apply_research_contract(
         text = str(claim.get("claim") or "").strip()
         if not text:
             continue
-        store.add_research_claim(
+        claim_id = store.add_research_claim(
             research["id"],
             claim=text,
-            status=str(claim.get("status") or "uncertain"),
+            status="uncertain",
             support=str(claim.get("support") or ""),
             confidence=_int_or_zero(claim.get("confidence")),
             notes=str(claim.get("notes") or ""),
-            metadata=claim,
+            metadata={**claim, 'verification_status': 'unverified'},
         )
+        for link in _list_of_dicts(claim.get('evidence_links')):
+            try:
+                EvidenceLedger(store).link_claim_evidence(
+                    research['id'], claim_id, int(link['passage_id']),
+                    relation=str(link.get('relation') or 'supports'),
+                    verification_status=str(link.get('verification_status') or 'unverified'),
+                    verifier=f'codex-control:{run_id}' if run_id is not None else 'research-contract',
+                    notes=str(link.get('notes') or ''),
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                store.add_research_event(research['id'], event_type='evidence_link_rejected', level='warning',
+                    message=str(exc), payload={'claim_id': claim_id}, source='mycodex')
         claim_count += 1
 
     for idea in _list_of_dicts(contract.get("idea_ledger_delta")):
@@ -251,6 +265,11 @@ def build_research_control_context(
         "ideas": ideas,
         "tasks": tasks,
         "events": events,
+        "evidence_passages": EvidenceLedger(store).search_evidence(
+            research['id'], str(research['question'] or '') + ' ' + ' '.join(idea.get('title', '') for idea in ideas),
+            limit=8),
+        "evidence_links": EvidenceLedger(store).list_evidence(research['id'], limit=8),
+        "search_receipts": EvidenceLedger(store).list_search_receipts(research['id'], limit=6),
     }
     compact_context = _compact_for_control_context(context)
     return json.dumps(compact_context, ensure_ascii=False, indent=2)
@@ -473,17 +492,18 @@ def render_research_markdown(store: Store, project_name: str, research_name: str
             "",
             "## Claims",
             "",
-            "| ID | Status | Confidence | Claim | Support |",
-            "|---|---|---:|---|---|",
+            "| ID | Status | Verification | Confidence | Claim | Support |",
+            "|---|---|---|---:|---|---|",
         ]
     )
     lines.extend(
-        f"| {row['id']} | {_md_escape(row['status'])} | {row['confidence']} | "
+        f"| {row['id']} | {_md_escape(row['status'])} | "
+        f"{_md_escape(_json_dict(row['metadata_json']).get('verification_status', 'legacy_unverified'))} | {row['confidence']} | "
         f"{_md_escape(_truncate(row['claim'], 220))} | {_md_escape(_truncate(row['support'], 120))} |"
         for row in claims
     )
     if not claims:
-        lines.append("| - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - |")
     lines.extend(
         [
             "",
@@ -1005,9 +1025,9 @@ def _record_concept_preflight(
             "Concept preflight: define the research problem by mechanism axes, "
             "query families, and anchor promotion criteria before ranking ideas."
         ),
-        status="supported",
-        support="research control preflight",
-        confidence=5,
+        status="uncertain",
+        support="",
+        confidence=0,
         notes=_concept_preflight_notes(preflight),
         metadata={
             "kind": _CONCEPT_PREFLIGHT_KIND,
@@ -1198,9 +1218,13 @@ def _run_search_like_task(
     rejected_ids: list[int] = []
     seen_source_ids: set[int] = set()
     scored_count = 0
+    search_receipts: list[dict[str, Any]] = []
     min_relevance = _int_or_zero(payload.get("min_relevance") if "min_relevance" in payload else 2)
     for query in queries:
-        for result in searcher(query, providers=providers, limit=limit, timeout=timeout):
+        batch, receipt = _search_with_receipts(store, research, task, query, searcher=searcher,
+                                               providers=providers, limit=limit, timeout=timeout)
+        search_receipts.append(receipt)
+        for result in batch:
             kwargs = _source_kwargs_from_result(result)
             if not kwargs:
                 continue
@@ -1215,7 +1239,8 @@ def _run_search_like_task(
             kwargs["evidence_quality"] = quality["evidence_quality"]
             kwargs["role"] = quality["role"]
             kwargs["status"] = quality["status"]
-            source_id = store.upsert_research_source(research["id"], **kwargs)
+            source_id = _upsert_search_result(store, research['id'], kwargs)
+            _index_search_abstract(store, research['id'], source_id, kwargs)
             scored_count += 1
             if source_id in seen_source_ids:
                 continue
@@ -1226,6 +1251,10 @@ def _run_search_like_task(
                 rejected_ids.append(source_id)
     all_sources = [_row_to_source_dict(row) for row in store.list_research_sources(research["id"], limit=200)]
     coverage = coverage_summary(question, all_sources)
+    coverage['search_status'] = _search_coverage(search_receipts)
+    coverage['exhaustive'] = False
+    if coverage['search_status'] == 'unavailable':
+        raise RuntimeError('all requested research providers unavailable; see search coverage receipts')
     next_tasks: list[int] = []
     if bool(payload.get("auto_synthesize")):
         synth_payload = {"reason": "search completed", "source_task_id": task["id"]}
@@ -1250,7 +1279,117 @@ def _run_search_like_task(
         "coverage": coverage,
         "queued_tasks": next_tasks,
         "providers": providers or ["zotero", "arxiv", "openalex", "semanticscholar"],
+        "search_receipts": search_receipts,
     }
+
+
+def _search_with_receipts(store, research, task, query, *, searcher, providers, limit, timeout):
+    kwargs = {'providers': providers, 'limit': limit, 'timeout': timeout}
+    if searcher is search_public_sources:
+        kwargs['cache_dir'] = store.path.parent / 'research_cache'
+    try:
+        batch = searcher(query, **kwargs)
+        receipts = getattr(batch, 'receipts', None)
+        if receipts is None:
+            # Existing injected searchers return ordinary lists. Their coverage
+            # cannot be inferred from result count, including an empty list.
+            receipts = [{'provider': 'injected_searcher', 'status': 'unknown',
+                         'result_count': len(batch), 'exhaustive': False}]
+        coverage = getattr(batch, 'coverage', 'unknown')
+    except Exception as exc:
+        receipts = [{'provider': 'searcher', 'status': 'error', 'error_type': type(exc).__name__,
+                     'error': _redact_sensitive(str(exc)), 'exhaustive': False}]
+        coverage = 'unavailable'
+        batch = []
+    ledger = EvidenceLedger(store)
+    receipt_id = ledger.record_search(research['id'], query, receipts=receipts,
+                                      coverage=coverage, task_id=task['id'])
+    summary = {'receipt_id': receipt_id, 'query': query, 'coverage': coverage, 'providers': receipts}
+    store.add_research_event(research['id'], event_type='search_coverage',
+        level='warning' if coverage in {'partial', 'unavailable'} else 'info',
+        message=f'Research search coverage: {coverage}; {len(batch)} bounded results.',
+        payload=summary, source='mycodex')
+    return batch, summary
+
+
+def _search_coverage(receipts):
+    states = {item['coverage'] for item in receipts}
+    if states == {'unavailable'}:
+        return 'unavailable'
+    if states & {'partial', 'unavailable'}:
+        return 'partial'
+    return 'unknown' if 'unknown' in states or not states else 'complete_requested'
+
+
+def _index_search_abstract(store, research_id, source_id, kwargs):
+    metadata = kwargs.get('metadata') or {}
+    abstract = str(metadata.get('abstract') or '')
+    if abstract.strip():
+        ledger = EvidenceLedger(store)
+        if any(version['extraction_method'] != 'provider-abstract'
+               for version in ledger.get_source_versions(research_id, source_id)):
+            return  # Searching again must not replace indexed full-text with an abstract.
+        ledger.index_source(research_id, source_id, text=abstract,
+            location=str(kwargs.get('url') or ''), extraction_method='provider-abstract',
+            metadata={'coverage': 'abstract', 'provider': metadata.get('provider'),
+                      'matched_query': metadata.get('matched_query')})
+
+
+def _upsert_search_result(store, research_id, kwargs):
+    existing = store.conn.execute('SELECT * FROM research_sources WHERE research_id = ? AND url = ?',
+                                  (research_id, kwargs.get('url', ''))).fetchone()
+    if existing is not None and existing['depth'] in {'skim', 'deep'}:
+        previous = _json_dict(existing['metadata_json'])
+        # A fresh bibliographic lookup does not undo a successful reading.
+        kwargs = {**kwargs, 'depth': existing['depth'], 'notes': existing['notes'],
+                  'evidence_quality': max(existing['evidence_quality'], kwargs.get('evidence_quality', 0)),
+                  'metadata': {**previous, **kwargs.get('metadata', {})}}
+        if existing['status'] == 'kept' and kwargs.get('status') != 'rejected':
+            kwargs['status'] = 'kept'
+    return store.upsert_research_source(research_id, **kwargs)
+
+
+def _require_ingested_text(store, research, source, result, text):
+    if text.strip() and result.get('extraction_status') != 'unavailable':
+        return
+    ingestion = _ingestion_metadata(result)
+    ingestion['extraction_status'] = 'unavailable'
+    if source is not None:
+        source_id = source['id']
+        old_metadata = _json_dict(source['metadata_json']) if 'metadata_json' in source.keys() else source.get('metadata') or {}
+        # Keep a previously successful read version and its depth intact. A failed
+        # refresh is a separate availability observation and never better evidence.
+        store.update_research_source(source_id, metadata={**old_metadata, 'last_ingestion_attempt': ingestion})
+    else:
+        source_id = None
+    store.add_research_event(research['id'], event_type='source_extraction_unavailable', level='warning',
+        message='Source text extraction unavailable; reading and evidence were not promoted.',
+        payload={'source_id': source_id, 'ingestion': ingestion}, source='mycodex')
+    raise RuntimeError('source text extraction unavailable or empty')
+
+
+def _index_ingestion(store, research_id, source_id, result, text):
+    return EvidenceLedger(store).index_source(research_id, source_id, text=text,
+        location=str(result.get('resolved_location') or result.get('location') or ''),
+        extraction_method=str(result.get('method') or ''),
+        content_hash=result.get('content_hash'),
+        metadata={key: value for key, value in result.items() if key not in {'text', 'passages'}},
+        passages=result.get('passages'))
+
+
+def _ingestion_metadata(result):
+    metadata = {key: value for key, value in result.items() if key not in {'text', 'passages', 'document_structure'}}
+    summary = document_summary(result)
+    if summary is not None:
+        metadata['document_summary'] = summary
+    return metadata
+
+
+def _ingestion_depth(requested, result):
+    summary = document_summary(result)
+    if requested == 'deep' and summary is not None and not summary['coverage'].get('complete_text_extraction'):
+        return 'skim'
+    return requested
 
 
 def _run_deep_read_task(
@@ -1280,17 +1419,19 @@ def _run_deep_read_task(
         raise RuntimeError("deep_read task has no source URL/path")
     result = ingester(location, max_chars=max_chars, timeout=timeout)
     text = str(result.get("text") or "")
+    _require_ingested_text(store, research, source, result, text)
     existing_metadata = _json_dict(source["metadata_json"]) if source is not None else {}
     metadata = {
         **existing_metadata,
-        "ingestion": {k: v for k, v in result.items() if k != "text"},
+        "ingestion": _ingestion_metadata(result),
     }
     notes = _deep_read_notes(result, text)
     if source is not None:
+        version = _index_ingestion(store, research['id'], int(source_id), result, text)
         store.update_research_source(
             source["id"],
             status="kept",
-            depth=str(payload.get("depth") or "skim"),
+            depth=_ingestion_depth(str(payload.get("depth") or "skim"), result),
             notes=notes,
             metadata=metadata,
         )
@@ -1301,11 +1442,11 @@ def _run_deep_read_task(
             url=location,
             source_type=str(payload.get("source_type") or "paper"),
             role=str(payload.get("role") or "candidate"),
-            depth=str(payload.get("depth") or "skim"),
-            status="kept",
-            notes=notes,
-            metadata=metadata,
+            depth='title', status='candidate',
         )
+        version = _index_ingestion(store, research['id'], int(source_id), result, text)
+        store.update_research_source(source_id, status='kept', depth=_ingestion_depth(str(payload.get('depth') or 'skim'), result),
+                                     notes=notes, metadata=metadata)
     return {
         "source_id": source_id,
         "location": location,
@@ -1314,6 +1455,10 @@ def _run_deep_read_task(
         "bytes": result.get("bytes"),
         "chars": len(text),
         "method": result.get("method"),
+        "version_id": version['id'],
+        "content_hash": version['content_hash'],
+        "passage_ids": version['passage_ids'],
+        "document_summary": document_summary(result),
     }
 
 
@@ -1340,14 +1485,16 @@ def _run_deep_read_sources_task(
         try:
             result = ingester(location, max_chars=max_chars, timeout=timeout)
             text = str(result.get("text") or "")
+            _require_ingested_text(store, research, source, result, text)
             metadata = {
                 **_json_dict(source["metadata_json"]),
-                "ingestion": {key: value for key, value in result.items() if key != "text"},
+                "ingestion": _ingestion_metadata(result),
             }
+            version = _index_ingestion(store, research['id'], source['id'], result, text)
             store.update_research_source(
                 source["id"],
                 status="kept",
-                depth="deep" if len(text) >= 2000 else "skim",
+                depth=_ingestion_depth("deep" if len(text) >= 2000 else "skim", result),
                 notes=_deep_read_notes(result, text),
                 metadata=metadata,
                 evidence_quality=min(5, int(source["evidence_quality"] or 0) + 1),
@@ -1359,6 +1506,8 @@ def _run_deep_read_sources_task(
                     "location": location,
                     "chars": len(text),
                     "method": result.get("method"),
+                    "version_id": version['id'],
+                    "passage_ids": version['passage_ids'],
                 }
             )
         except Exception as exc:
@@ -1395,15 +1544,17 @@ def _run_deep_read_top_task(
         try:
             result = ingester(location, max_chars=max_chars, timeout=timeout)
             text = str(result.get("text") or "")
+            _require_ingested_text(store, research, source, result, text)
             existing_metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
             metadata = {
                 **existing_metadata,
-                "ingestion": {k: v for k, v in result.items() if k != "text"},
+                "ingestion": _ingestion_metadata(result),
             }
+            version = _index_ingestion(store, research['id'], source_id, result, text)
             store.update_research_source(
                 source_id,
                 status="kept",
-                depth="deep" if len(text) >= 2000 else "skim",
+                depth=_ingestion_depth("deep" if len(text) >= 2000 else "skim", result),
                 notes=_deep_read_notes(result, text),
                 metadata=metadata,
                 evidence_quality=min(5, int(source.get("evidence_quality") or 0) + 1),
@@ -1415,10 +1566,15 @@ def _run_deep_read_top_task(
                     "location": location,
                     "chars": len(text),
                     "method": result.get("method"),
+                    "version_id": version['id'],
+                    "passage_ids": version['passage_ids'],
                 }
             )
         except Exception as exc:
             failures.append({"source_id": source_id, "title": source["title"], "error": str(exc)})
+    if selected and not ingested:
+        raise RuntimeError('deep_read_top could not extract any selected source: '
+                           + '; '.join(str(item['error']) for item in failures[:3]))
     return {
         "selected": len(selected),
         "ingested": ingested,
@@ -1543,6 +1699,7 @@ def _run_threat_search_task(
     ideas = _selected_ideas(store, research["id"], payload)
     source_ids: list[int] = []
     per_idea: dict[str, list[int]] = {}
+    search_receipts: list[dict[str, Any]] = []
     for idea in ideas:
         queries = threat_queries_for_idea(
             _row_to_idea_dict(idea),
@@ -1550,8 +1707,13 @@ def _run_threat_search_task(
             max_queries=int(payload.get("max_queries") or 3),
         )
         threat_ids: list[int] = []
+        idea_receipts = []
         for query in queries:
-            for result in searcher(query, providers=providers, limit=limit, timeout=timeout):
+            batch, receipt = _search_with_receipts(store, research, task, query, searcher=searcher,
+                                                   providers=providers, limit=limit, timeout=timeout)
+            search_receipts.append(receipt)
+            idea_receipts.append(receipt)
+            for result in batch:
                 kwargs = _source_kwargs_from_result(result)
                 if not kwargs:
                     continue
@@ -1568,7 +1730,8 @@ def _run_threat_search_task(
                 kwargs["evidence_quality"] = quality["evidence_quality"]
                 kwargs["role"] = "counterevidence" if quality["relevance"] >= 2 else quality["role"]
                 kwargs["status"] = "candidate" if quality["relevance"] >= 2 else "rejected"
-                source_id = store.upsert_research_source(research["id"], **kwargs)
+                source_id = _upsert_search_result(store, research['id'], kwargs)
+                _index_search_abstract(store, research['id'], source_id, kwargs)
                 if source_id not in threat_ids:
                     threat_ids.append(source_id)
                 if source_id not in source_ids:
@@ -1581,14 +1744,20 @@ def _run_threat_search_task(
                 **metadata,
                 "threat_source_ids": sorted(set([*existing_threats, *threat_ids])),
                 "threat_search_queries": queries,
+                "threat_search_coverage": _search_coverage(idea_receipts),
+                "threat_search_receipt_ids": [item['receipt_id'] for item in idea_receipts],
             },
         )
         per_idea[str(idea["id"])] = threat_ids
+    if search_receipts and _search_coverage(search_receipts) == 'unavailable':
+        raise RuntimeError('all requested threat-search providers unavailable; novelty remains unverified')
     return {
         "ideas": len(ideas),
         "source_ids": source_ids,
         "sources": len(source_ids),
         "per_idea": per_idea,
+        "search_coverage": _search_coverage(search_receipts),
+        "search_receipts": search_receipts,
     }
 
 
@@ -1856,11 +2025,17 @@ def _read_location(source, payload: dict[str, Any], task) -> str:
             value = metadata.get(key)
             if value:
                 return str(value)
-        if str(source["url"] or "").startswith(("http://", "https://", "file://", "/", "~")):
+        if _is_read_location(str(source['url'] or '')):
             return str(source["url"])
-    if task["query"] and str(task["query"]).startswith(("http://", "https://", "/", "~")):
+    if task['query'] and _is_read_location(str(task['query'])):
         return str(task["query"])
     return ""
+
+
+def _is_read_location(value: str) -> bool:
+    if value.startswith(('http://', 'https://', 'file://', '/', '~')):
+        return True
+    return bool(value) and Path(value).expanduser().is_absolute()
 
 
 def _source_kwargs_from_result(result: Any) -> dict[str, Any]:
@@ -1907,6 +2082,7 @@ def _row_to_source_dict(row) -> dict[str, Any]:
 
 
 def _row_to_claim_dict(row) -> dict[str, Any]:
+    metadata = _json_dict(row['metadata_json'])
     return {
         "id": row["id"],
         "source_id": row["source_id"],
@@ -1916,7 +2092,8 @@ def _row_to_claim_dict(row) -> dict[str, Any]:
         "support": row["support"],
         "confidence": row["confidence"],
         "notes": _truncate(row["notes"], 700),
-        "metadata": _json_dict(row["metadata_json"]),
+        "metadata": metadata,
+        "verification_status": metadata.get('verification_status', 'legacy_unverified'),
         "updated_at": row["updated_at"],
     }
 
@@ -1973,6 +2150,12 @@ def _deep_read_notes(result: dict[str, Any], text: str) -> str:
     location = result.get("resolved_location") or result.get("location") or ""
     method = result.get("method") or "unknown"
     header = f"Ingested text excerpt via {method} from {location}."
+    summary = document_summary(result)
+    if summary is not None:
+        coverage = summary['coverage']
+        header += (f" Physical pages processed: {coverage.get('pages_processed', 'unknown')}/"
+                   f"{coverage.get('page_count', 'unknown')}; truncated={bool(result.get('truncated'))}. "
+                   "Structure locators are extraction candidates; scientific and mathematical validity remain unverified.")
     if not text.strip():
         return header + "\n\nNo extractable text was found."
     return header + "\n\n" + text.strip()
