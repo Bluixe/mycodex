@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from mycodex.db import Store
-from mycodex.web import create_app
+from mycodex.web import _local_iso_time, create_app
 
 
 class _CachedInsights:
@@ -123,6 +124,36 @@ class WebInsightTests(unittest.TestCase):
                      "/api/insights?project=missing", "/insights?project=missing"):
             self.assertEqual(self.client.get(path).status_code, 404)
 
+    def test_coverage_labels_and_source_updates_preserve_report_as_of_scope(self):
+        report = self.service.reports[0]
+        report["source_changed"] = True
+        report["source_freshness"] = "changed"
+        report["coverage"].update({"projects": ["demo"], "scope": "仅可见用户原话",
+            "visible_user_messages": 2, "visible_user_chars": 100, "model_context_char_budget": 12000,
+            "context_truncated_messages": 1, "latest_selected_at": "2026-10-23T01:00:00Z",
+            "visible_chars": 200, "visible_unknown_timestamp_count": 0, "partial_sessions": 1})
+        report["current_source_coverage"] = {"visible_message_count": 9, "sessions": [{"status": "stale", "thread_id": "thread"}]}
+        original = copy.deepcopy(report)
+        html = self.client.get("/insights?project=demo").text
+        self.assertIn("来源对话已有更新，请重新分析", html)
+        for label in ("可见用户消息数", "可见用户消息字符数", "模型上下文字符上限", "分析项目", "分析范围",
+                      "本次截断消息数", "本次选取的最新对话时间", "可见消息字符数", "可见消息中时间未知的条数",
+                      "报告生成时的对话覆盖与缺口", "当前来源状态（仅检查文件信息）"):
+            self.assertIn(label, html)
+        for key in ("visible_user_messages", "model_context_char_budget", "context_truncated_messages", "latest_selected_at"):
+            self.assertNotIn(key, html)
+        self.assertEqual(report, original)
+        self.assertIn("来源对话已有更新，请重新分析", self.client.get("/").text)
+
+        # Partial reading is a coverage limit, not proof that the source grew.
+        report.update(source_changed=False, source_freshness="unchanged_within_indexed_sources", stale=False)
+        report["current_source_coverage"]["sessions"][0]["status"] = "partial"
+        self.assertNotIn("来源对话已有更新，请重新分析", self.client.get("/insights?project=demo").text)
+        report.update(source_freshness="unknown", stale=True)
+        uncertain = self.client.get("/insights?project=demo").text
+        self.assertIn("当前来源是否可用尚无法确认", uncertain)
+        self.assertNotIn("来源对话已有更新，请重新分析", uncertain)
+
     def test_profile_edit_forms_escape_content_and_disable_automatic_refresh(self):
         response = self.client.get("/profile")
         self.assertEqual(response.status_code, 200)
@@ -230,6 +261,20 @@ class RealInsightBackendWebSmokeTests(unittest.TestCase):
                 self.assertIn("&lt;script&gt;", html.text)
                 self.assertNotIn("<script>bad()", html.text)
                 self.assertEqual(client.get("/api/jobs").json(), [])
+
+
+class InsightTimestampTests(unittest.TestCase):
+    def test_timezone_aware_iso_values_keep_the_same_instant_and_show_local_offset(self):
+        rendered = _local_iso_time("2026-10-23T01:02:03Z")
+        self.assertEqual(rendered, _local_iso_time("2026-10-23T06:32:03+05:30"))
+        self.assertRegex(rendered, r"^2026-10-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}$")
+        displayed = datetime.strptime(rendered, "%Y-%m-%d %H:%M:%S %z")
+        self.assertEqual(displayed.timestamp(), datetime(2026, 10, 23, 1, 2, 3, tzinfo=timezone.utc).timestamp())
+
+    def test_unknown_naive_and_epoch_values_do_not_gain_a_fabricated_timezone(self):
+        for value in (None, "", "invalid", 1234, True):
+            self.assertEqual(_local_iso_time(value), "时间未知")
+        self.assertEqual(_local_iso_time("2026-10-23T01:02:03"), "时间未知（来源未提供时区）")
 
 
 if __name__ == "__main__":

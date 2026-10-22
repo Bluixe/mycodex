@@ -2,11 +2,36 @@
 <span class="citation-links">{% for id in ids|default([], true) %}<a href="/conversations/messages/{{ id }}">来源 #{{ id }}</a>{% else %}<span class="muted">暂无可定位来源</span>{% endfor %}</span>
 {%- endmacro %}
 
-{% macro coverage_details(coverage) -%}
+{% macro coverage_details(coverage, title="对话覆盖与缺口") -%}
+{% set labels = {
+  "project_name":"项目", "projects":"分析项目", "scope":"分析范围", "reason":"说明",
+  "visible_message_count":"可见消息数", "redacted_message_count":"已脱敏消息数",
+  "visible_user_messages":"可见用户消息数", "visible_user_chars":"可见用户消息字符数",
+  "visible_chars":"可见消息字符数", "visible_unknown_timestamp_count":"可见消息中时间未知的条数",
+  "context_char_budget":"本次上下文字符上限", "model_context_char_budget":"模型上下文字符上限",
+  "latest_timestamp_unknown":"部分最新时间未知", "thread_count":"对话数", "message_count":"消息数",
+  "project_count":"项目数", "missing_sources":"缺失来源", "truncated":"内容是否截断",
+  "warnings":"覆盖提示", "gaps":"覆盖缺口", "indexed_sessions":"已登记对话数",
+  "synced_sessions":"已读取对话数", "complete":"对话覆盖完整", "complete_sessions":"完整读取对话数",
+  "partial_sessions":"部分读取或已过期对话数", "cached_messages":"已缓存消息数",
+  "user_messages":"用户消息数", "assistant_messages":"助手消息数",
+  "oldest_recorded_at":"最早已知对话时间", "latest_recorded_at":"最新已知对话时间",
+  "unknown_time_messages":"时间未知消息数", "context_chars":"本次选用字符数",
+  "context_message_count":"本次选用消息数", "context_omitted_for_size":"因篇幅省略消息数",
+  "context_recent_days":"选取最近天数", "context_truncated_messages":"本次截断消息数",
+  "latest_selected_at":"本次选取的最新对话时间", "context_excluded_unknown_time":"未选用的时间未知消息数",
+  "context_candidates_limited":"候选消息存在数量限制"
+} %}
 <details class="coverage-details">
-  <summary>对话覆盖与缺口</summary>
+  <summary>{{ title }}</summary>
   {% if coverage %}<dl class="coverage-grid">{% for key, value in coverage.items() %}
-    {% if key != "sessions" %}<div><dt>{{ {"project_name":"项目", "visible_message_count":"可见消息数", "redacted_message_count":"已脱敏消息数", "context_char_budget":"本次上下文字符上限", "latest_timestamp_unknown":"部分最新时间未知", "thread_count":"对话数", "message_count":"消息数", "project_count":"项目数", "missing_sources":"缺失来源", "truncated":"内容是否截断", "warnings":"覆盖提示", "gaps":"覆盖缺口", "indexed_sessions":"已登记对话数", "synced_sessions":"已读取对话数", "complete":"对话覆盖完整", "complete_sessions":"完整读取对话数", "partial_sessions":"部分读取或已过期对话数", "cached_messages":"已缓存消息数", "user_messages":"用户消息数", "assistant_messages":"助手消息数", "oldest_recorded_at":"最早已知对话时间", "latest_recorded_at":"最新已知对话时间", "unknown_time_messages":"时间未知消息数", "context_chars":"本次选用字符数", "context_message_count":"本次选用消息数", "context_omitted_for_size":"因篇幅省略消息数", "context_recent_days":"选取最近天数", "context_excluded_unknown_time":"未选用的时间未知消息数", "context_candidates_limited":"候选消息存在数量限制"}.get(key, key) }}</dt><dd>{% if value is boolean %}{{ "是" if value else "否" }}{% elif value is none %}未知{% elif value is sequence and value is not string and value is not mapping %}{{ value|join("；") }}{% else %}{{ value }}{% endif %}</dd></div>{% endif %}
+    {% if key != "sessions" %}<div><dt>{{ labels.get(key, key) }}</dt><dd>
+      {% if value is boolean %}{{ "是" if value else "否" }}
+      {% elif value is none %}未知
+      {% elif key in ["oldest_recorded_at", "latest_recorded_at", "latest_selected_at"] %}{{ value|local_iso }}
+      {% elif value is sequence and value is not string and value is not mapping %}{{ value|join("；") }}
+      {% else %}{{ value }}{% endif %}
+    </dd></div>{% endif %}
   {% endfor %}</dl>{% else %}<p class="muted">尚无覆盖记录，不能据此确认完整进展。</p>{% endif %}
   {% if coverage.sessions %}<details><summary>逐条对话的读取状态（{{ coverage.sessions|length }} 条）</summary><ul class="insight-facts">{% for source in coverage.sessions %}<li><code>{{ source.thread_id or "对话编号未知" }}</code> · {{ {"complete":"完整读取", "partial":"部分读取", "stale":"来源已更新", "unavailable":"来源不可用", "not_synced":"尚未读取"}.get(source.status, source.status or "状态未知") }}{% if source.error %}<p>{{ source.error }}</p>{% endif %}</li>{% endfor %}</ul></details>{% endif %}
 </details>

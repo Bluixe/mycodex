@@ -7,7 +7,7 @@
 </section>
 <section class="panel profile-notice">
   <p>确认、修正、拒绝或遗忘会立即保存。遗忘会清空此画像条目及其依据引用，不会删除原始对话；人工修正保留为你的明确反馈。</p>
-  <p class="muted">分析时间：{{ profile.generated_at or "尚未生成" }} · {% if profile.mode == "extractive" %}当前仅为摘录候选，尚未完成模型分析{% elif profile.mode == "unavailable" %}待分析{% else %}分析状态：{{ profile.model_status or "未知" }}{% endif %}</p>
+  <p class="muted">分析时间：{{ profile.generated_at|local_iso if profile.generated_at else "尚未生成" }} · {% if profile.mode == "extractive" %}当前仅为摘录候选，尚未完成模型分析{% elif profile.mode == "unavailable" %}待分析{% else %}分析状态：{{ profile.model_status or "未知" }}{% endif %} · 时间按本机时区显示，末尾附 UTC 偏移。</p>
   <p>{% if include_inactive %}<a href="/profile">隐藏已拒绝和已遗忘条目</a>{% else %}<a href="/profile?include_inactive=true">查看已拒绝和已遗忘状态</a>{% endif %}</p>
   {{ coverage_details(profile.coverage) }}
 </section>
@@ -16,7 +16,7 @@
 <article class="panel profile-item" id="profile-{{ item.id }}">
   <div class="section-head"><h2>{{ {"goal":"工作目标", "goals":"工作目标", "preference":"协作偏好", "preferences":"协作偏好", "work_preference":"工作偏好", "communication_preference":"交流偏好", "interest":"研究方向与工作兴趣", "research":"研究方向", "research_direction":"研究方向", "workflow":"工作方式", "constraint":"工作约束"}.get(item.category, "工作信息") }}</h2>
     <span class="badge {{ 'warning' if item.status == 'candidate' else 'info' }}">{{ {"candidate":"候选 · 待确认", "confirmed":"已确认", "corrected":"已人工修正", "rejected":"已拒绝", "forgotten":"已遗忘"}.get(item.status, "待确认") }}</span></div>
-  <p class="muted">{{ ("项目：" ~ item.project_name) if item.scope == "project" else "全局工作偏好" }} · 更新时间：{{ item.updated_at or item.created_at or "未知" }} · 第 {{ item.version }} 版</p>
+  <p class="muted">{{ ("项目：" ~ item.project_name) if item.scope == "project" else "全局工作偏好" }} · 更新时间：{{ (item.updated_at or item.created_at)|local_iso }} · 第 {{ item.version }} 版</p>
   {% if item.status == "forgotten" %}<p class="muted">该条目已遗忘，内容与画像引用已清除。</p>
   {% else %}
   <p class="insight-summary">{{ item.text }}</p>

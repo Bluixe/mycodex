@@ -1,6 +1,7 @@
 import copy
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -192,6 +193,32 @@ class InsightsTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("proposed", result["errors"][0]["error"])
 
+    def test_completed_parallel_action_and_disposal_jiang_are_not_future_plan(self):
+        # Regression from the retained, real analysis final answer: source 522
+        # said 已通读…并完成; 将X改为Y described an edit already reported made.
+        self.archive.data[2]["text"] = "已通读六个部分并完成整体修订，更新为v0.14。这次主要调整了：将综述中的实验检查清单改为研究进展论述。"
+        report = project()
+        report["summary"] = fact("助手报告已完成六部分整体修订并更新为v0.14。", "assistant_reported", [2])
+        data = self.insights._validate_report(report, self.insights._context("one"))
+        self.assertEqual(data["summary"], report["summary"]["text"])
+
+    def test_denied_completion_verification_is_not_positive_completion_claim(self):
+        self.archive.data[2]["text"] = "下一步计划完成初步检查。"
+        report = project(assistant=None)
+        for text in ["不能据此认定已通过独立审阅。", "无法确认全篇已完成。", "Completion is not yet completed."]:
+            with self.subTest(text=text):
+                report["assessment"] = fact(text, "inferred", [2])
+                self.insights._validate_report(report, self.insights._context("one"))
+
+    def test_source_uncertainty_does_not_license_completed_claim(self):
+        self.archive.data[2]["text"] = "下一步计划完成初步检查，目前无法确认已完成。"
+        with self.assertRaisesRegex(ValueError, "proposed"):
+            self.insights._validate_report(project(), self.insights._context("one"))
+        report = project()
+        report["progress"][0]["text"] = "无法确认部署情况，但助手报告已完成初步检查。"
+        with self.assertRaisesRegex(ValueError, "proposed"):
+            self.insights._validate_report(report, self.insights._context("one"))
+
     def test_failed_turn_or_unconfirmed_terminal_cannot_publish(self):
         for status, terminal in [("failed", True), ("interrupted", True), ("completed", False)]:
             with self.subTest(status=status, terminal=terminal):
@@ -278,6 +305,23 @@ class InsightsTests(unittest.TestCase):
         self.archive.data[1]["text"] += "。我的宗教信仰不应进入画像"
         result, *_ = self.refresh(candidates=[candidate(text="我的宗教信仰不应进入画像")])
         self.assertEqual(result["profile"]["items"], [])
+
+    def test_public_income_statistics_and_code_diagnosis_are_work_topics(self):
+        for text in ["为每个城市填充人口、GDP、人均可支配收入，寻找可信的数据源。",
+                     "把这个故障诊断和修改方案记录到本地，然后修改代码。"]:
+            with self.subTest(text=text):
+                self.archive.data[1]["text"] = "请研究可靠性。" + text
+                result, *_ = self.refresh(candidates=[candidate(text=text, quote=text)], force=True)
+                self.assertFalse(any(e["purpose"] == "profile" for e in result["errors"]))
+
+    def test_personal_income_and_medical_diagnosis_stay_excluded(self):
+        for text in ["我的个人收入是每月两万元", "我的医疗诊断需要保密", "我被诊断为焦虑症",
+                     "my personal income is private", "my medical diagnosis is private"]:
+            with self.subTest(text=text):
+                self.assertTrue(self.insights._sensitive(text))
+                self.archive.data[1]["text"] = "请研究可靠性。" + text
+                result, *_ = self.refresh(candidates=[candidate(text=text, quote=text)], force=True)
+                self.assertEqual(result["profile"]["items"], [])
 
     def test_confirmed_and_corrected_items_are_not_overwritten(self):
         result, *_ = self.refresh()
@@ -385,6 +429,67 @@ class InsightsTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["errors"][0]["purpose"], "archive_sync")
         self.assertIn("sync_error", result["projects"][0]["coverage"])
+
+    def test_source_freshness_is_checked_without_overwriting_report_asof_coverage(self):
+        self.insights.refresh(["one"], use_model=False)
+        before = self.insights.project_report("one")
+        changed = {"indexed_sessions": 1, "complete": False, "sessions": [{"status": "stale"}]}
+        with patch.object(self.archive, "coverage", return_value=changed), patch.object(self.archive, "sync") as sync:
+            after = self.insights.project_report("one")
+            sync.assert_not_called()
+        self.assertTrue(after["stale"])
+        self.assertTrue(after["source_changed"])
+        self.assertEqual(after["source_freshness"], "changed")
+        self.assertEqual(after["coverage"], before["coverage"])
+        self.assertEqual(after["generated_at"], before["generated_at"])
+        self.assertEqual(after["current_source_coverage"], changed)
+        partial = {"complete": False, "partial_sessions": 1, "sessions": [{"status": "partial"}]}
+        with patch.object(self.archive, "coverage", return_value=partial):
+            bounded = self.insights.project_report("one")
+        self.assertFalse(bounded["stale"])
+        self.assertFalse(bounded["source_changed"])
+
+    def test_directory_cleanup_happens_after_close_and_warning_is_not_model_failure(self):
+        real_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(real_temp.cleanup)
+        client = Runtime({"projects": []})
+        checks = []
+
+        class HeldDirectory:
+            name = real_temp.name
+
+            def cleanup(inner):
+                checks.append(client.closed)
+                raise PermissionError("[WinError 32] file in use: " + inner.name)
+
+        with patch("mycodex.insights.tempfile.TemporaryDirectory", return_value=HeldDirectory()), patch("mycodex.service._runtime_client", return_value=client):
+            output, receipt = self.insights._model("projects", [], deadline=time.monotonic()+10, token_budget=1000,
+                prior_tokens=0, cancellation_callback=None, usage_callback=None)
+        self.assertEqual(checks, [True])
+        self.assertEqual(output, {"projects": []})
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["error"], "")
+        self.assertTrue(receipt["archived"])
+        self.assertEqual(receipt["directory_cleanup_status"], "failed")
+        self.assertNotIn(real_temp.name, json.dumps(receipt))
+        self.assertEqual(receipt["cleanup_warnings"], [{"stage": "temporary_directory", "error_type": "PermissionError"}])
+
+    def test_runtime_error_redacts_repr_escaped_temporary_directory(self):
+        client = Runtime({"projects": []})
+        failed_path = []
+
+        def fail(method, params, timeout=None):
+            failed_path.append(params["cwd"])
+            raise OSError(32, "file in use", params["cwd"])
+
+        with patch.object(client, "request", side_effect=fail), patch("mycodex.service._runtime_client", return_value=client):
+            output, receipt = self.insights._model("projects", [], deadline=time.monotonic()+10, token_budget=1000,
+                prior_tokens=0, cancellation_callback=None, usage_callback=None)
+        self.assertIsNone(output)
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("[temporary analysis directory]", receipt["error"])
+        self.assertNotIn(failed_path[0], receipt["error"])
+        self.assertNotIn(repr(failed_path[0])[1:-1], receipt["error"])
 
     def test_shared_deadline_second_turn_receives_remaining_time(self):
         clients = [Runtime({"projects": [project()]}), Runtime({"items": []})]

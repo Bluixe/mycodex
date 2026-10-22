@@ -3,7 +3,7 @@
 
 {% block content %}
 <section class="page-head">
-  <div><h1>项目洞察</h1><p>从已索引的本地对话整理项目目标、进展与下一步；对话中的结果尚需代码、日志或实验产物核验。</p></div>
+  <div><h1>项目洞察</h1><p>从已索引的本地对话整理项目目标、进展与下一步；对话中的结果尚需代码、日志或实验产物核验。</p><p class="muted">时间按本机时区显示，末尾附 UTC 偏移。</p></div>
   <a class="button secondary" href="/profile">查看用户画像</a>
 </section>
 
@@ -30,13 +30,15 @@
 <article class="panel insight-report" id="insight-{{ report.project_name }}">
   <div class="section-head">
     <div><h2><a href="/projects/{{ report.project_name|urlencode }}">{{ report.project_name }}</a></h2>
-      <p class="muted">报告覆盖的最近对话：{{ report.latest_message_at or report.coverage.latest_recorded_at or "时间未知或尚无对话" }} · 分析时间：{{ report.generated_at or "尚未分析" }}{% if report.version %} · 第 {{ report.version }} 版{% endif %}</p>
+      <p class="muted">报告覆盖的最近对话：{{ (report.latest_message_at or report.coverage.latest_recorded_at)|local_iso }} · 分析时间：{{ report.generated_at|local_iso if report.generated_at else "尚未分析" }}{% if report.version %} · 第 {{ report.version }} 版{% endif %}</p>
     </div>
     {% if not report.report_id %}<span class="badge warning">待分析</span>
     {% elif report.stale %}<span class="badge warning">需更新分析</span>
     {% elif report.mode == "extractive" %}<span class="badge info">摘录记录 · 尚无模型评估</span>
     {% else %}<span class="badge info">已保存分析</span>{% endif %}
   </div>
+  {% if report.report_id and report.source_changed %}<p class="badge warning">来源对话已有更新，请重新分析。当前仍显示报告生成时的分析与覆盖范围。</p>
+  {% elif report.report_id and report.source_freshness == "unknown" %}<p class="muted">当前来源是否可用尚无法确认，以下保留上次分析；可展开当前来源状态查看缺口。</p>{% endif %}
   {% if report.report_id %}
   <p class="insight-summary">{{ report.summary }}</p>
   <dl class="insight-description"><div><dt>项目目标</dt><dd>{{ report.objective or "现有对话不足以确认目标。" }}</dd></div><div><dt>当前阶段</dt><dd>{{ report.stage or "当前阶段无法确认。" }}</dd></div></dl>
@@ -52,8 +54,9 @@
   <div class="report-citations">{{ citations(report.citations) }}</div>
   {% else %}<p class="insight-summary muted">待分析：尚未生成有来源的项目综述。连接了项目或存在对话，均不代表已经完成分析。</p>{% endif %}
   {% if report.model_status and report.model_status not in ["completed", "ready", "success", "not_generated"] %}<p class="muted">分析状态：{{ report.model_status }}</p>{% endif %}
-  {% if report.last_attempt %}<details><summary>最近一次分析尝试</summary>{% if report.last_attempt is mapping %}<p>状态：{{ report.last_attempt.model_status or report.last_attempt.status or "未知" }} · {{ report.last_attempt.generated_at or report.last_attempt.at or "时间未知" }}</p>{% if report.last_attempt.error %}<p class="insight-text">{{ report.last_attempt.error }}</p>{% endif %}{% else %}<p class="insight-text">{{ report.last_attempt }}</p>{% endif %}</details>{% endif %}
-  {{ coverage_details(report.coverage) }}
+  {% if report.last_attempt %}<details><summary>最近一次分析尝试</summary>{% if report.last_attempt is mapping %}<p>状态：{{ report.last_attempt.model_status or report.last_attempt.status or "未知" }} · {{ (report.last_attempt.generated_at or report.last_attempt.at)|local_iso }}</p>{% if report.last_attempt.error %}<p class="insight-text">{{ report.last_attempt.error }}</p>{% endif %}{% else %}<p class="insight-text">{{ report.last_attempt }}</p>{% endif %}</details>{% endif %}
+  {{ coverage_details(report.coverage, "报告生成时的对话覆盖与缺口") }}
+  {% if report.stale and report.current_source_coverage %}{{ coverage_details(report.current_source_coverage, "当前来源状态（仅检查文件信息）") }}{% endif %}
 </article>
 {% else %}
 <section class="empty"><h2>尚无已连接项目</h2><p>连接项目并索引本地对话后，即可排队分析。</p></section>

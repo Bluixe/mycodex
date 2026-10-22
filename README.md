@@ -69,7 +69,7 @@ Opening or reloading a page never triggers inference.
 
 Derived reports are versioned and retain their source references. A failed refresh
 retains the last successful report with an explicit stale/error state. Identical
-source fingerprints reuse cached analysis. Profile items start as candidates;
+source fingerprints reuse cached analysis. Opening a report only checks indexed source file metadata; changed or unavailable sources are flagged while the original report time and coverage remain visible. Profile items start as candidates;
 confirmations/corrections survive regeneration. Rejecting or forgetting an item
 blocks its automatic reintroduction by key. Forgetting removes the derived item
 text/references from local profile versions while keeping a suppression hash;

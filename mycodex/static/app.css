@@ -777,6 +777,7 @@ td p {
 .insight-project-picker legend { color: var(--muted); font-size: 12px; }
 .insight-preview { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
 .insight-preview p { margin: 6px 0; overflow-wrap: anywhere; }
+.insight-preview .badge, .insight-report > .badge { white-space: normal; line-height: 1.5; }
 .insight-summary { font-size: 16px; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
 .insight-description { display: grid; gap: 16px; margin: 20px 0; }
 .insight-description dd { white-space: pre-wrap; }

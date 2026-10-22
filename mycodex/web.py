@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -50,6 +51,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     templates.env.filters["priority"] = _priority_label
     templates.env.filters["compact_int"] = _compact_int
     templates.env.filters["format_int"] = _format_int
+    templates.env.filters["local_iso"] = _local_iso_time
 
     def render(request: Request, template: str, context: dict[str, Any]) -> HTMLResponse:
         base_context = {
@@ -521,6 +523,19 @@ def _insights(store: Store):
 def _submit_insight_refresh(store: Store, *, project_names: list[str] | None):
     from .insight_tasks import submit_insight_refresh
     return submit_insight_refresh(store, project_names=project_names)
+
+
+def _local_iso_time(value: Any) -> str:
+    """Display a timezone-aware source time locally without guessing its zone."""
+    if not isinstance(value, str) or not value.strip():
+        return "时间未知"
+    try:
+        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            return "时间未知（来源未提供时区）"
+        return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (ValueError, OverflowError, OSError):
+        return "时间未知"
 
 
 def _redirect(path: str) -> RedirectResponse:
