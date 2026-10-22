@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "insight_macros.html" import citations, coverage_details %}
+{% block content %}
+<section class="page-head">
+  <div><h1>用户画像</h1><p>仅整理工作目标、研究方向与协作偏好，不推断敏感身份、健康或人格特征。候选内容需要你确认。</p></div>
+  <a class="button secondary" href="/insights">选择项目并更新分析</a>
+</section>
+<section class="panel profile-notice">
+  <p>确认、修正、拒绝或遗忘会立即保存。遗忘会清空此画像条目及其依据引用，不会删除原始对话；人工修正保留为你的明确反馈。</p>
+  <p class="muted">分析时间：{{ profile.generated_at or "尚未生成" }} · {% if profile.mode == "extractive" %}当前仅为摘录候选，尚未完成模型分析{% elif profile.mode == "unavailable" %}待分析{% else %}分析状态：{{ profile.model_status or "未知" }}{% endif %}</p>
+  <p>{% if include_inactive %}<a href="/profile">隐藏已拒绝和已遗忘条目</a>{% else %}<a href="/profile?include_inactive=true">查看已拒绝和已遗忘状态</a>{% endif %}</p>
+  {{ coverage_details(profile.coverage) }}
+</section>
+<div class="insight-stack">
+{% for item in profile["items"] %}
+<article class="panel profile-item" id="profile-{{ item.id }}">
+  <div class="section-head"><h2>{{ {"goal":"工作目标", "goals":"工作目标", "preference":"协作偏好", "preferences":"协作偏好", "work_preference":"工作偏好", "communication_preference":"交流偏好", "interest":"研究方向与工作兴趣", "research":"研究方向", "research_direction":"研究方向", "workflow":"工作方式", "constraint":"工作约束"}.get(item.category, "工作信息") }}</h2>
+    <span class="badge {{ 'warning' if item.status == 'candidate' else 'info' }}">{{ {"candidate":"候选 · 待确认", "confirmed":"已确认", "corrected":"已人工修正", "rejected":"已拒绝", "forgotten":"已遗忘"}.get(item.status, "待确认") }}</span></div>
+  <p class="muted">{{ ("项目：" ~ item.project_name) if item.scope == "project" else "全局工作偏好" }} · 更新时间：{{ item.updated_at or item.created_at or "未知" }} · 第 {{ item.version }} 版</p>
+  {% if item.status == "forgotten" %}<p class="muted">该条目已遗忘，内容与画像引用已清除。</p>
+  {% else %}
+  <p class="insight-summary">{{ item.text }}</p>
+  {% if item.status == "candidate" %}<p class="profile-basis"><span class="badge {{ 'info' if item.basis == 'explicit' else 'warning' }}">{% if item.basis == "explicit" %}用户明确表达{% elif item.basis == "inferred" %}模型归纳，待确认{% else %}表达依据类型未知，待确认{% endif %}</span></p>{% endif %}
+  {% if item.quote %}<blockquote class="profile-quote">{{ item.quote }}</blockquote>{% else %}<p class="muted">暂无逐字引文，可打开来源核对。</p>{% endif %}
+  <p class="muted">来源性质：{{ {"user_stated":"用户消息", "user_corrected":"用户人工修正", "assistant_reported":"助手消息 · 尚未独立核验", "inferred":"历史推断记录", "unknown":"未知"}.get(item.evidence_kind, "未知") }}</p>
+  {{ citations(item.citations) }}
+  {% if item.status not in ["rejected", "forgotten"] %}
+  <div class="actions profile-actions">
+    {% if item.status == "candidate" %}<form method="post" action="/profile/{{ item.id }}/confirm"><button type="submit">确认此条</button></form>{% endif %}
+    <form method="post" action="/profile/{{ item.id }}/reject"><button type="submit" class="secondary">拒绝</button></form>
+    <form method="post" action="/profile/{{ item.id }}/forget"><button type="submit" class="secondary">遗忘此条</button></form>
+  </div>
+  <details class="profile-edit"><summary>修正这条信息</summary><form method="post" action="/profile/{{ item.id }}/correct">
+    <label for="profile-text-{{ item.id }}">以你的表述替换</label>
+    <textarea id="profile-text-{{ item.id }}" name="text" rows="3" maxlength="2000" required>{{ item.text }}</textarea>
+    <button type="submit">保存修正</button>
+  </form></details>
+  {% else %}<form method="post" action="/profile/{{ item.id }}/forget"><button type="submit" class="secondary">遗忘此条</button></form>{% endif %}
+  {% endif %}
+</article>
+{% else %}<section class="empty"><h2>尚无可显示的画像条目</h2><p>可前往项目洞察，明确选择本地对话后排队分析。这里不会用默认画像填补缺失证据。</p></section>{% endfor %}
+</div>
+{% endblock %}

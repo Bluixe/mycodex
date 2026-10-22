@@ -102,6 +102,30 @@ def register_commands(sub) -> None:
     benchmarks.add_argument('--gate-ref', help='Fail unless this revision has a nonempty fully passing case set')
     benchmarks.add_argument('--live-material-pair', action='store_true', help='Explicitly run two read-only model tasks (30000 observed-token budget each)')
     benchmarks.set_defaults(handler=cmd_benchmarks, no_store=True)
+    insights = sub.add_parser('insights', help='Read conversation-backed project reports or request a bounded refresh')
+    actions = insights.add_subparsers(dest='insights_action', required=True)
+    show = actions.add_parser('show')
+    show.add_argument('--project')
+    show.set_defaults(handler=cmd_insights)
+    refresh = actions.add_parser('refresh')
+    refresh.add_argument('--project', action='append', dest='project_names')
+    refresh.add_argument('--extractive-only', action='store_true', help='Index/excerpt only; do not call a model')
+    refresh.add_argument('--enqueue', action='store_true')
+    refresh.add_argument('--force', action='store_true')
+    refresh.add_argument('--timeout', type=int, default=360)
+    refresh.add_argument('--token-budget', type=int, default=120000)
+    refresh.set_defaults(handler=cmd_insights)
+    profile = sub.add_parser('profile', help='Inspect, correct or remove conversation-derived work preferences')
+    actions = profile.add_subparsers(dest='profile_action', required=True)
+    show = actions.add_parser('show')
+    show.add_argument('--all', action='store_true', dest='include_inactive')
+    show.set_defaults(handler=cmd_profile)
+    for name in ('confirm', 'reject', 'correct', 'forget'):
+        action = actions.add_parser(name)
+        action.add_argument('item_id', type=int)
+        if name == 'correct':
+            action.add_argument('--text', required=True)
+        action.set_defaults(handler=cmd_profile)
 
 
 def cmd_doctor(_store, _args):
@@ -248,3 +272,31 @@ def cmd_benchmarks(_store, args):
     emit(result)
     if args.gate_ref and not result['gate']['passed']:
         raise ValueError('benchmark gate failed: ' + result['gate']['reason'])
+
+
+def cmd_insights(store, args):
+    if args.insights_action == 'show':
+        from .insights import Insights
+        service = Insights(store)
+        emit(service.project_report(args.project) if args.project else service.overview())
+        return
+    from .insight_tasks import submit_insight_refresh
+    from .jobs import run_worker, JobQueue
+    job = submit_insight_refresh(store, args.project_names, use_model=not args.extractive_only,
+        force=args.force, timeout=args.timeout, max_total_tokens=args.token_budget, source='cli')
+    if not args.enqueue:
+        run_worker(store, once=True, job_id=job['id'])
+        job = JobQueue(store).get(job['id'])
+    emit(job)
+    if job['status'] in {'failed', 'blocked', 'cancelled'}:
+        raise ValueError(job.get('error') or 'insight refresh did not complete')
+
+
+def cmd_profile(store, args):
+    from .insights import Insights
+    service = Insights(store)
+    if args.profile_action == 'show':
+        emit(service.profile(include_inactive=args.include_inactive))
+    else:
+        emit(service.update_profile(args.item_id, action=args.profile_action,
+                                    text=getattr(args, 'text', '')))

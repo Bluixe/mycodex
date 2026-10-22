@@ -55,7 +55,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         base_context = {
             "request": request,
             "db_path": str(resolved_db_path),
-            "assets_version": "20260515-daily-summary-notify",
+            "assets_version": "20261023-insights",
         }
         base_context.update(context)
         return templates.TemplateResponse(request, template, base_context)
@@ -64,15 +64,106 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def index(request: Request):
         with Store(resolved_db_path) as store:
             snapshot = snapshot_to_jsonable(dashboard_snapshot(store))
+            insight_reports = {report["project_name"]: report
+                              for report in _insights(store).overview()["projects"]}
         return render(
             request,
             "index.html",
             {
                 "snapshot": snapshot,
+                "insight_reports": insight_reports,
                 "page_title": "Projects",
                 "refresh_interval_ms": 20000,
             },
         )
+
+    @app.get("/insights", response_class=HTMLResponse)
+    def insights_page(request: Request, project: str | None = None):
+        with Store(resolved_db_path) as store:
+            service = _insights(store)
+            if project is not None:
+                if store.get_project(project) is None:
+                    return JSONResponse({"error": "unknown project"}, status_code=404)
+                overview = service.overview()
+                reports = [service.project_report(project)]
+            else:
+                overview = service.overview()
+                reports = overview["projects"]
+        return render(request, "insights.html", {"page_title": "项目洞察", "overview": overview,
+            "reports": reports, "selected_project": project, "refresh_interval_ms": 0})
+
+    @app.get("/profile", response_class=HTMLResponse)
+    def profile_page(request: Request, include_inactive: bool = False):
+        with Store(resolved_db_path) as store:
+            profile = _insights(store).profile(include_inactive=include_inactive)
+        return render(request, "profile.html", {"page_title": "用户画像", "profile": profile,
+            "include_inactive": include_inactive, "refresh_interval_ms": 0})
+
+    @app.get("/api/insights")
+    def api_insights(project: str | None = None):
+        with Store(resolved_db_path) as store:
+            service = _insights(store)
+            if project is not None:
+                if store.get_project(project) is None:
+                    return JSONResponse({"error": "unknown project"}, status_code=404)
+                return JSONResponse(service.project_report(project))
+            return JSONResponse(service.overview())
+
+    @app.get("/api/profile")
+    def api_profile(include_inactive: bool = False):
+        with Store(resolved_db_path) as store:
+            return JSONResponse(_insights(store).profile(include_inactive=include_inactive))
+
+    @app.get("/api/conversations/messages/{message_id}")
+    def api_conversation_message(message_id: int):
+        with Store(resolved_db_path) as store:
+            message = _insights(store).evidence(message_id)
+        return JSONResponse(message if message is not None else {"error": "unknown message"},
+                            status_code=200 if message is not None else 404)
+
+    @app.get("/conversations/messages/{message_id}", response_class=HTMLResponse)
+    def conversation_message(request: Request, message_id: int):
+        with Store(resolved_db_path) as store:
+            message = _insights(store).evidence(message_id)
+        if message is None:
+            return JSONResponse({"error": "unknown message"}, status_code=404)
+        return render(request, "evidence.html", {"page_title": f"对话来源 #{message_id}",
+            "message": message, "message_id": message_id, "refresh_interval_ms": 0})
+
+    @app.post("/insights/refresh")
+    async def refresh_insights(request: Request):
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        project_names = list(dict.fromkeys(name.strip() for name in form.get("project_names", []) if name.strip()))
+        if len(project_names) > 20:
+            return JSONResponse({"error": "at most 20 projects may be selected"}, status_code=400)
+        with Store(resolved_db_path) as store:
+            if any(store.get_project(name) is None for name in project_names):
+                return JSONResponse({"error": "unknown project"}, status_code=404)
+            try:
+                _submit_insight_refresh(store, project_names=project_names or None)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+        return _redirect("/jobs")
+
+    @app.post("/profile/{item_id}/{action}")
+    async def update_profile_item(item_id: int, action: str, request: Request):
+        if action not in {"confirm", "reject", "correct", "forget"}:
+            return JSONResponse({"error": "unknown profile action"}, status_code=404)
+        form = await _read_form(request)
+        text = form.get("text", "").strip()
+        if action == "correct" and (not text or len(text) > 2000):
+            return JSONResponse({"error": "correction text must contain 1 to 2000 characters"}, status_code=400)
+        with Store(resolved_db_path) as store:
+            try:
+                item = _insights(store).update_profile(item_id, action=action, text=text)
+            except LookupError:
+                return JSONResponse({"error": "unknown profile item"}, status_code=404)
+            except ValueError as exc:
+                status = 404 if "unknown" in str(exc).lower() or "not found" in str(exc).lower() else 400
+                return JSONResponse({"error": str(exc)}, status_code=status)
+        if item is None:
+            return JSONResponse({"error": "unknown profile item"}, status_code=404)
+        return _redirect("/profile")
 
     @app.get("/projects/{project_name}", response_class=HTMLResponse)
     def project_detail(request: Request, project_name: str):
@@ -420,6 +511,16 @@ async def _read_form(request: Request) -> dict[str, str]:
     body = (await request.body()).decode("utf-8")
     parsed = parse_qs(body, keep_blank_values=True)
     return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _insights(store: Store):
+    from .insights import Insights
+    return Insights(store)
+
+
+def _submit_insight_refresh(store: Store, *, project_names: list[str] | None):
+    from .insight_tasks import submit_insight_refresh
+    return submit_insight_refresh(store, project_names=project_names)
 
 
 def _redirect(path: str) -> RedirectResponse:

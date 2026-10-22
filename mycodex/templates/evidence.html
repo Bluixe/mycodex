@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><div><h1>对话来源 #{{ message_id }}</h1><p>这是本地索引中的对话证据，用于核对分析；消息中的结论仍可能需要独立验证。</p></div><a class="button secondary" href="/insights">返回项目洞察</a></section>
+<article class="panel evidence-message">
+  <dl class="coverage-grid">
+    <div><dt>消息角色</dt><dd>{{ {"user":"用户", "assistant":"助手", "system":"系统", "tool":"工具"}.get(message.role, message.role or "未知") }}</dd></div>
+    <div><dt>对话时间</dt><dd>{{ message.recorded_at or "未知" }}</dd></div>
+    <div><dt>项目</dt><dd>{{ message.project_name or "未归属项目" }}</dd></div>
+    <div><dt>来源类型</dt><dd>{{ message.source_kind or "未知" }}</dd></div>
+    <div><dt>本地来源</dt><dd>{{ message.source_path or "未知" }}</dd></div>
+    <div><dt>定位记录</dt><dd>{{ message.locator or "未知" }}</dd></div>
+    <div><dt>内容校验值</dt><dd>{{ message.content_hash or "未知" }}</dd></div>
+  </dl>
+  {% if message.redacted %}<p class="badge warning">已脱敏，隐藏部分内容</p>{% endif %}
+  {% if message.truncated %}<p class="badge warning">展示内容已截断，不代表完整对话</p>{% endif %}
+  <pre class="insight-text">{{ message.text }}</pre>
+</article>
+{% endblock %}

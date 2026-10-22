@@ -31,6 +31,77 @@ You can also run without installing:
 python3 -m mycodex --help
 ```
 
+## Conversation-backed project insights and user profile (0.4)
+
+The dashboard's **项目洞察** and **用户画像** pages read the conversations of
+explicitly selected registered projects. They show project goals, reported
+progress, blockers, next steps and an evidence-backed assessment, plus candidate
+work/communication preferences. Every factual item links to the cached source
+message and its time. An assistant's completion claim remains a report from the
+conversation, not independent proof that a server or experiment is healthy now.
+
+### Route selection
+
+| Route | Use | Tradeoff |
+| --- | --- | --- |
+| Native history API / local rollout index | Read source dialogue without resuming an original thread | API pagination and local log formats must be handled explicitly; cloud-only chats need an authorized source connector or export |
+| Entire history in each prompt | Useful for a small one-off conversation | A 134 MB local rollout is unsuitable for repeated full-context analysis |
+| Bounded recent evidence plus versioned derived reports | Implemented first stage | Reports expose partial windows; they do not claim exhaustive historical recall |
+| Semantic/graph retrieval across older episodes | Possible extension when older cross-session recall is needed | Requires retrieval evaluation and additional indexing; not implied by this release |
+
+The source layer incrementally caches bounded user/assistant messages from
+registered session logs in the application's SQLite database. It strips injected
+environment/system/memory blocks, tool payloads and reasoning, redacts recognizable
+credentials, and checks source thread identity/project context. Source log files
+are read-only. Receipts expose unavailable, skipped, migrated and truncated data,
+the available time window, and message counts. Unknown timestamps remain unknown.
+
+On explicit refresh, two isolated read-only model tasks analyze the recent
+project evidence and user-authored preferences, respectively. They use the existing
+Codex login/runtime, a temporary analysis directory, strict JSON schemas, bounded
+time/tokens, and are archived afterwards. Original project conversations are not
+resumed. Analysis-specific shell/search/app restrictions are requested through
+per-thread configuration, and tool activity interrupts analysis. A real empty-thread
+probe confirmed read-only, no network, and approval denial; the runtime did not
+return a full effective tool/MCP list. Source dialogue is data, never authorization
+for an action.
+Opening or reloading a page never triggers inference.
+
+Derived reports are versioned and retain their source references. A failed refresh
+retains the last successful report with an explicit stale/error state. Identical
+source fingerprints reuse cached analysis. Profile items start as candidates;
+confirmations/corrections survive regeneration. Rejecting or forgetting an item
+blocks its automatic reintroduction by key. Forgetting removes the derived item
+text/references from local profile versions while keeping a suppression hash;
+it does not delete the original conversation. Project-specific requests stay
+scoped to that project. Each candidate separates the model's concise interpretation
+from a literal user quotation and its evidence type. Quote matching establishes
+provenance; the interpretation remains a candidate until reviewed. The profile concerns stated goals, interests and working
+preferences; it does not infer sensitive traits or personality/health diagnoses.
+
+```text
+mycodex insights refresh --project tc --project htmlgame --enqueue
+mycodex insights refresh --extractive-only
+mycodex insights show --project tc
+mycodex profile show
+mycodex profile correct 12 --text "Prefer a brief explanation followed by the working local page."
+mycodex profile forget 12
+```
+
+An unqualified refresh selects registered projects except the control project's
+`mycodex` entry. The durable worker processes the request. The default aggregate
+bound is 120,000 observed tokens and 360 seconds across both model tasks; actual
+usage and unknown usage are reported separately. Event-based token interruption
+is not a provider billing cap. Recent evidence is bounded to 12,000 characters
+per project and the user-only profile input to 24,000 characters overall. No
+scheduled refresh is enabled by this feature.
+
+Design references: the [official app-server history API](https://learn.chatgpt.com/docs/app-server)
+provides non-resuming, paginated reads; [LongMemEval](https://arxiv.org/abs/2410.10813)
+motivates temporal updates, source retrieval and abstention; [Mem0](https://arxiv.org/abs/2504.19413)
+describes extracting and consolidating persistent conversational information.
+These papers inform the design; their benchmark scores are not results for this app.
+
 ## Follow-up iteration (0.3)
 
 All ordinary CLI sends and summaries now save a durable job before execution.

@@ -279,6 +279,7 @@ class CodexAppServerClient:
         approval_policy: str = "never",
         model: str | None = None,
         reasoning_effort: str | None = None,
+        config_overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "cwd": cwd,
@@ -287,6 +288,8 @@ class CodexAppServerClient:
         }
         if model:
             params["model"] = model
+        if config_overrides is not None:
+            params['config'] = dict(config_overrides)
         if thread_id:
             params["threadId"] = thread_id
             result = self.request("thread/resume", params, timeout=90)

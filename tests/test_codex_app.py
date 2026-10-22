@@ -24,6 +24,20 @@ def terminal(status="completed", **turn):
 
 
 class CodexRuntimeTests(unittest.TestCase):
+    def test_analysis_thread_config_overrides_are_explicit_and_do_not_change_defaults(self):
+        client = CodexAppServerClient('unused-fixture-runtime')
+        overrides = {'features.shell_tool': False, 'web_search': 'disabled'}
+        with patch.object(client, 'request', return_value={'thread': {'id': 'analysis'}}) as request:
+            client.start_or_resume_thread(thread_id=None, cwd='temporary-analysis', config_overrides=overrides)
+            params = request.call_args.args[1]
+            self.assertEqual(request.call_args.args[0], 'thread/start')
+            self.assertEqual(params['config'], overrides)
+            self.assertIsNot(params['config'], overrides)
+            self.assertEqual(params['sandbox'], 'read-only')
+            self.assertEqual(params['approvalPolicy'], 'never')
+            client.start_or_resume_thread(thread_id=None, cwd='ordinary-project')
+            self.assertNotIn('config', request.call_args.args[1])
+
     def test_explicit_binary_wins_over_environment_and_desktop(self):
         with patch.dict(os.environ, {"MYCODEX_CODEX_BIN": "configured", "CODEX_CLI_PATH": "desktop"}):
             self.assertEqual(_resolve_codex_bin("explicit"), "explicit")

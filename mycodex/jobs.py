@@ -11,7 +11,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from .db import Store
 
-JOB_KINDS = {"prompt", "daily_summary", "sync_sessions", "research_task", "experiment_task", "review_synthesis"}
+JOB_KINDS = {"prompt", "daily_summary", "sync_sessions", "research_task", "experiment_task", "review_synthesis", "insight_refresh"}
 TERMINAL = {"succeeded", "failed", "cancelled", "blocked"}
 
 
@@ -89,7 +89,8 @@ class JobQueue:
                   "new_thread", "max_total_tokens", "update_default_thread", "notification"}
         specific = {"prompt": {"prompt", "kind"}, "daily_summary": set(), "sync_sessions": set(),
                     "research_task": {"name", "task_id"}, "experiment_task": {"name"},
-                    "review_synthesis": {"prompt", "review_job_ids", "kind"}}
+                    "review_synthesis": {"prompt", "review_job_ids", "kind"},
+                    "insight_refresh": {"project_names", "use_model", "force"}}
         if set(payload) - common - specific[kind]:
             raise ValueError("unknown payload fields: " + ", ".join(sorted(set(payload) - common - specific[kind])))
         if any(type(payload[key]) is not bool for key in ("new_thread", "update_default_thread") if key in payload):
@@ -107,6 +108,16 @@ class JobQueue:
                     or set(payload["review_job_ids"]) != set(dependencies)):
                 raise ValueError("synthesis review ids must match dependency ids")
             payload.update(sandbox="read-only", approval_policy="never", new_thread=True, update_default_thread=False)
+        if kind == "insight_refresh":
+            from .insight_tasks import validate_insight_scope
+            payload['project_names'] = validate_insight_scope(self.store, payload.get('project_names'))
+            if project_name not in payload['project_names']:
+                raise ValueError('insight job owner must be included in its selected project scope')
+            for key in ('use_model', 'force'):
+                if key in payload and type(payload[key]) is not bool:
+                    raise ValueError(f'{key} must be a boolean')
+            payload.update(sandbox='read-only', approval_policy='never', new_thread=True,
+                           update_default_thread=False, notification={'enabled': False})
         if kind in {"research_task", "experiment_task"} and not payload.get("name"):
             raise ValueError("research/experiment name is required")
         timeout = payload.get("timeout", 1800)
@@ -134,9 +145,20 @@ class JobQueue:
         if kind == "research_task":
             resource = f"research:{project['id']}:{payload['name']}"
         access_mode = "read" if payload["sandbox"] == "read-only" and kind != "experiment_task" else "write"
+        if kind == 'insight_refresh':
+            # The sources stay read-only, while local reports/profile updates
+            # must serialize across project scopes to avoid duplicate inference.
+            resource, access_mode = 'insights:local', 'write'
         ts = int(time.time())
         try:
             self.conn.execute("BEGIN IMMEDIATE")
+            if kind == 'insight_refresh':
+                pending = self.conn.execute("""SELECT id FROM jobs WHERE kind=? AND request_json=?
+                    AND status IN ('queued','leased','running') ORDER BY id LIMIT 1""",
+                    (kind, request_json)).fetchone()
+                if pending is not None:
+                    self.conn.commit()
+                    return self.get(pending['id'])
             if idempotency_key:
                 prior = self.conn.execute("SELECT * FROM jobs WHERE project_id=? AND idempotency_key=?",
                                           (project["id"], idempotency_key)).fetchone()
@@ -417,6 +439,9 @@ def run_worker(store: Store, *, once: bool = False, max_jobs: int = 1, interval:
 def _execute_job(store: Store, job: dict, cancelled, usage_limit) -> dict:
     from . import service
     payload = job["payload"]
+    if job['kind'] == 'insight_refresh':
+        from .insight_tasks import execute_insight_refresh
+        return execute_insight_refresh(store, job, cancelled, usage_limit)
     project_name = job["project_name"]
     if cancelled():
         return {"status": "cancelled", "not_started": True}

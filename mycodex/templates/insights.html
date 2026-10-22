@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% from "insight_macros.html" import citations, coverage_details %}
+
+{% block content %}
+<section class="page-head">
+  <div><h1>项目洞察</h1><p>从已索引的本地对话整理项目目标、进展与下一步；对话中的结果尚需代码、日志或实验产物核验。</p></div>
+  <a class="button secondary" href="/profile">查看用户画像</a>
+</section>
+
+<section class="panel insight-refresh" aria-labelledby="analysis-heading">
+  <h2 id="analysis-heading">更新对话分析</h2>
+  <p>点击后会读取所选项目的本地对话片段，通过当前 Codex 登录运行模型分析，并进入后台任务队列。仅浏览页面不会调用模型。</p>
+  <form method="post" action="/insights/refresh">
+    <details {% if selected_project %}open{% endif %}>
+      <summary>选择分析项目（最多 20 个）</summary>
+      <fieldset class="insight-project-picker"><legend>留空时分析默认项目，排除 mycodex 管理项目</legend>
+        {% for report in overview.projects %}
+        <label class="check"><input type="checkbox" name="project_names" value="{{ report.project_name }}" {% if selected_project == report.project_name %}checked{% endif %}>{{ report.project_name }}</label>
+        {% endfor %}
+      </fieldset>
+    </details>
+    <button type="submit">排队进行模型分析</button>
+    <a href="/jobs">查看分析任务</a>
+  </form>
+</section>
+
+{% if selected_project %}<p><a href="/insights">← 查看所有项目</a></p>{% endif %}
+<div class="insight-stack">
+{% for report in reports %}
+<article class="panel insight-report" id="insight-{{ report.project_name }}">
+  <div class="section-head">
+    <div><h2><a href="/projects/{{ report.project_name|urlencode }}">{{ report.project_name }}</a></h2>
+      <p class="muted">报告覆盖的最近对话：{{ report.latest_message_at or report.coverage.latest_recorded_at or "时间未知或尚无对话" }} · 分析时间：{{ report.generated_at or "尚未分析" }}{% if report.version %} · 第 {{ report.version }} 版{% endif %}</p>
+    </div>
+    {% if not report.report_id %}<span class="badge warning">待分析</span>
+    {% elif report.stale %}<span class="badge warning">需更新分析</span>
+    {% elif report.mode == "extractive" %}<span class="badge info">摘录记录 · 尚无模型评估</span>
+    {% else %}<span class="badge info">已保存分析</span>{% endif %}
+  </div>
+  {% if report.report_id %}
+  <p class="insight-summary">{{ report.summary }}</p>
+  <dl class="insight-description"><div><dt>项目目标</dt><dd>{{ report.objective or "现有对话不足以确认目标。" }}</dd></div><div><dt>当前阶段</dt><dd>{{ report.stage or "当前阶段无法确认。" }}</dd></div></dl>
+  <div class="insight-columns">
+    {% for title, lines in [("近期进展", report.progress), ("阻碍与未决问题", report.blockers), ("下一步", report.next_steps)] %}
+    <section><h3>{{ title }}</h3>{% if lines %}<ul>{% for line in lines %}<li>{{ line }}</li>{% endfor %}</ul>{% else %}<p class="muted">现有记录未提供可确认的信息。</p>{% endif %}</section>
+    {% endfor %}
+  </div>
+  <section class="insight-assessment"><h3>基于对话的评估</h3><p>{{ report.assessment or "尚无足够依据形成评估。" }}</p></section>
+  {% if report.facts %}<details class="fact-details"><summary>逐条依据与事实类型</summary><ul class="insight-facts">
+    {% for fact in report.facts %}<li><span class="badge {{ 'warning' if fact.kind == 'inferred' else 'info' }}">{{ {"user_stated":"用户明确陈述", "assistant_reported":"助手报告 · 尚未独立核验", "inferred":"分析推断", "unknown":"依据不足"}.get(fact.kind, "依据不足") }}</span><p>{{ fact.text }}</p>{{ citations(fact.citations) }}</li>{% endfor %}
+  </ul></details>{% endif %}
+  <div class="report-citations">{{ citations(report.citations) }}</div>
+  {% else %}<p class="insight-summary muted">待分析：尚未生成有来源的项目综述。连接了项目或存在对话，均不代表已经完成分析。</p>{% endif %}
+  {% if report.model_status and report.model_status not in ["completed", "ready", "success", "not_generated"] %}<p class="muted">分析状态：{{ report.model_status }}</p>{% endif %}
+  {% if report.last_attempt %}<details><summary>最近一次分析尝试</summary>{% if report.last_attempt is mapping %}<p>状态：{{ report.last_attempt.model_status or report.last_attempt.status or "未知" }} · {{ report.last_attempt.generated_at or report.last_attempt.at or "时间未知" }}</p>{% if report.last_attempt.error %}<p class="insight-text">{{ report.last_attempt.error }}</p>{% endif %}{% else %}<p class="insight-text">{{ report.last_attempt }}</p>{% endif %}</details>{% endif %}
+  {{ coverage_details(report.coverage) }}
+</article>
+{% else %}
+<section class="empty"><h2>尚无已连接项目</h2><p>连接项目并索引本地对话后，即可排队分析。</p></section>
+{% endfor %}
+</div>
+{% endblock %}
