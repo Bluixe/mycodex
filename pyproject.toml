@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mycodex"
-version = "0.1.0"
+version = "0.3.0"
 description = "Local Codex project and session manager"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]
+dev = ["httpx>=0.28"]
+documents = ["pdfplumber>=0.11"]
+sdk = ["openai-codex==0.163.0"]
 
 [project.scripts]
 mycodex = "mycodex.cli:main"

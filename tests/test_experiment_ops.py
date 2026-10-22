@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import os
+import shlex
+import sys
 import tempfile
 import json
 import subprocess
@@ -40,6 +44,20 @@ from mycodex.experiment_ops import (
     supervise_experiment,
     sync_remote_experiment_state,
 )
+
+
+def _script_payload(script):
+    return json.loads(base64.b64decode(shlex.split(script)[-1]))
+
+
+def _successful_launch_runner(target, script, ssh_key, timeout, **kwargs):
+    if "REMOTE_STATUS=" in script:
+        return RemoteExecResult(stdout="REMOTE_STATUS=running\n")
+    payload = _script_payload(script)
+    receipt = {"execution_id": payload["execution_id"], "manifest_sha256": payload["manifest_sha256"],
+               "status": "running", "pid": 123, "remote_commit": payload["commit"]}
+    encoded = base64.b64encode(json.dumps(receipt).encode()).decode()
+    return RemoteExecResult(stdout=f"REMOTE_COMMIT={payload['commit']}\nREMOTE_PID=123\nREMOTE_LOG=/remote/eval.log\nREMOTE_PID_FILE=/remote/eval.log.pid\nREMOTE_RECEIPT={encoded}\n")
 
 
 def _remote_snapshot(
@@ -225,7 +243,7 @@ class ExperimentOpsTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result["remote_pid"], "4242")
-                self.assertIn("python train.py", calls[0][1])
+                self.assertEqual(_script_payload(calls[0][1])["command"], "python train.py")
                 updated = store.get_experiment(project["id"], experiment["name"])
                 self.assertEqual(updated["phase"], "experiment_running")
                 self.assertEqual(updated["artifact_ref"], "/remote/repo/logs/run.log")
@@ -845,17 +863,7 @@ class ExperimentOpsTests(unittest.TestCase):
                 }
 
                 with patch("mycodex.experiment_ops.run_remote_script") as run_remote:
-                    run_remote.side_effect = [
-                        RemoteExecResult(
-                            stdout=(
-                                f"REMOTE_COMMIT={commit}\n"
-                                "REMOTE_PID=123\n"
-                                "REMOTE_LOG=/remote/log\n"
-                                "REMOTE_PID_FILE=/remote/log.pid\n"
-                            )
-                        ),
-                        RemoteExecResult(stdout="REMOTE_STATUS=running\n"),
-                    ]
+                    run_remote.side_effect = _successful_launch_runner
                     result = execute_execution_contract(store, "demo", "self-iterate", contract)
 
                 self.assertTrue(result["executed"])
@@ -897,7 +905,7 @@ class ExperimentOpsTests(unittest.TestCase):
                     )
 
                 self.assertTrue(result["executed"])
-                script = run_remote.call_args.args[1]
+                script = _script_payload(run_remote.call_args.args[1])["command"]
                 self.assertIn("export MYCODEX_REMOTE_PYTHON=/root/miniconda3/envs/dpt/bin/python3", script)
                 self.assertIn("export PATH=/root/miniconda3/envs/dpt/bin:$PATH", script)
                 self.assertIn("PYTHONDONTWRITEBYTECODE=1 python3 -B -", script)
@@ -1002,8 +1010,8 @@ class ExperimentOpsTests(unittest.TestCase):
                     "execution_class": "monitor-only",
                     "patch": {"required": False},
                     "local_checks": [
-                        "printf abc == abc",
-                        "printf '' is empty",
+                        f'"{sys.executable}" -c "print(\'abc\', end=\'\')" == abc',
+                        f'"{sys.executable}" -c "pass" is empty',
                     ],
                     "remote": {"command": "printf POSTRUN_JSON=ok\\n", "timeout": 10},
                 }
@@ -1096,6 +1104,9 @@ class ExperimentOpsTests(unittest.TestCase):
                 subprocess.run(["git", "init"], cwd=project_path, check=True, capture_output=True)
                 target = project_path / "tracked.txt"
                 target.write_text("old\n")
+                subprocess.run(["git", "add", "tracked.txt"], cwd=project_path, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                "commit", "-m", "Initial"], cwd=project_path, check=True, capture_output=True)
                 project = store.add_project("demo", project_path)
                 experiment = store.add_experiment(
                     project["id"],
@@ -1120,7 +1131,7 @@ class ExperimentOpsTests(unittest.TestCase):
                         "commit_message": "Test rollback",
                         "unified_diff": diff,
                     },
-                    "local_checks": ["python3 -c 'import sys; sys.exit(1)'"],
+                    "local_checks": [f'"{sys.executable}" -c "import sys; sys.exit(1)"'],
                     "remote": {},
                 }
 
@@ -1816,6 +1827,7 @@ class ExperimentOpsTests(unittest.TestCase):
                 self.assertIn("REMOTE_SYNC_DEFAULT_EVAL_ENVS='coinrun starpilot'", scripts[0])
                 self.assertNotIn("bossfight caveflyer", scripts[0])
 
+    @unittest.skipIf(os.name == "nt", "Remote state probe requires native POSIX paths and Linux bash")
     def test_sync_remote_state_discovers_latest_root_when_configured_root_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with Store(Path(tmp) / "db.sqlite") as store:
@@ -2290,17 +2302,7 @@ class ExperimentOpsTests(unittest.TestCase):
                 ) as peer_review_mock, patch(
                     "mycodex.experiment_ops.run_remote_script",
                 ) as run_remote:
-                    run_remote.side_effect = [
-                        RemoteExecResult(
-                            stdout=(
-                                f"REMOTE_COMMIT={commit}\n"
-                                "REMOTE_PID=123\n"
-                                "REMOTE_LOG=/remote/eval.log\n"
-                                "REMOTE_PID_FILE=/remote/eval.log.pid\n"
-                            )
-                        ),
-                        RemoteExecResult(stdout="REMOTE_STATUS=running\n"),
-                    ]
+                    run_remote.side_effect = _successful_launch_runner
                     result = run_experiment_watchdog(
                         store,
                         "demo",
@@ -2534,6 +2536,15 @@ class ExperimentOpsTests(unittest.TestCase):
                 self.assertEqual(first["experiments"][0]["control_result"]["reason"], "remote_monitor_command_failed")
                 self.assertTrue(second["experiments"][0]["control_result"]["executed"])
                 self.assertEqual(control_mock.call_count, 2)
+                protocol_tasks = sorted(store.list_experiment_tasks(experiment["id"], limit=10), key=lambda task: task["id"])
+                self.assertEqual(len(protocol_tasks), 2)
+                self.assertEqual(protocol_tasks[0]["status"], "failed")
+                self.assertEqual(protocol_tasks[0]["error"], "remote_monitor_command_failed")
+                self.assertEqual(protocol_tasks[1]["status"], "succeeded")
+                self.assertNotEqual(protocol_tasks[0]["id"], protocol_tasks[1]["id"])
+                retry = json.loads(protocol_tasks[1]["contract_json"])["_protocol_retry"]
+                self.assertEqual(retry["retry_of_task_id"], protocol_tasks[0]["id"])
+                self.assertEqual(retry["attempt"], 2)
                 event_types = [
                     event["event_type"]
                     for event in store.list_experiment_events(experiment["id"], limit=80)

@@ -47,6 +47,7 @@ class TelegramContext:
     username: str
     chat_type: str
     text: str
+    update_id: int | None = None
 
 
 class TelegramApiError(RuntimeError):
@@ -511,6 +512,26 @@ class TelegramBot:
         return binding
 
     def _start_prompt_task(
+        self, context: TelegramContext, binding, prompt: str, *, kind: str,
+        new_thread: bool = False, sandbox: str | None = None, approval_policy: str | None = None,
+    ) -> None:
+        if context.update_id is not None:
+            with Store(self.db_path) as store:
+                prior = store.conn.execute("SELECT id,status FROM jobs WHERE source='telegram' AND idempotency_key=? LIMIT 1",
+                    (f"telegram:{context.chat_id}:{context.update_id}",)).fetchone()
+            if prior is not None:
+                self.client.send_message(context.chat_id, f"Task #{prior['id']} is already saved ({prior['status']}).",
+                    message_thread_id=context.message_thread_id)
+                return
+        try:
+            self._start_prompt_task_impl(context, binding, prompt, kind=kind,
+                new_thread=new_thread, sandbox=sandbox, approval_policy=approval_policy)
+        except BaseException:
+            with self._active_lock:
+                self._active_bindings.discard((context.chat_id, context.message_thread_id or ""))
+            raise
+
+    def _start_prompt_task_impl(
         self,
         context: TelegramContext,
         binding,
@@ -546,9 +567,21 @@ class TelegramBot:
                 message_thread_id=context.message_thread_id,
             )
             return
+        from .jobs import JobQueue
+        payload = {"prompt": prompt, "kind": kind, "new_thread": new_thread,
+                   "timeout": self.codex_timeout, "update_default_thread": False}
+        if binding["thread_id"] and not new_thread:
+            payload["thread_id"] = binding["thread_id"]
+        if sandbox:
+            payload["sandbox"] = sandbox
+        if approval_policy:
+            payload["approval_policy"] = approval_policy
+        with Store(self.db_path) as store:
+            job = JobQueue(store).submit(binding["project_name"], "prompt", payload, source="telegram",
+                idempotency_key=f"telegram:{context.chat_id}:{context.update_id}" if context.update_id is not None else None)
         self.client.send_message(
             context.chat_id,
-            f"Started {kind} for {binding['project_name']}...",
+            f"Saved task #{job['id']} for {binding['project_name']}...",
             message_thread_id=context.message_thread_id,
         )
         thread = threading.Thread(
@@ -560,6 +593,7 @@ class TelegramBot:
                 "sandbox": sandbox,
                 "approval_policy": approval_policy,
                 "binding_key": binding_key,
+                "job_id": job["id"],
             },
             daemon=True,
         )
@@ -576,21 +610,19 @@ class TelegramBot:
         sandbox: str | None,
         approval_policy: str | None,
         binding_key: tuple[str, str],
+        job_id: int,
     ) -> None:
         try:
             with Store(self.db_path) as store:
-                result = send_prompt(
-                    store,
-                    binding["project_name"],
-                    prompt,
-                    kind=kind,
-                    thread_id=None if new_thread else binding["thread_id"],
-                    new_thread=new_thread,
-                    timeout=self.codex_timeout,
-                    sandbox=sandbox,
-                    approval_policy=approval_policy,
-                    update_default_thread=False,
-                )
+                from .jobs import JobQueue, run_worker
+                run_worker(store, once=True, job_id=job_id)
+                job = JobQueue(store).get(job_id)
+                result = job["result"]
+                if "thread_id" not in result:
+                    self.client.send_chunks(context.chat_id,
+                        f"Task #{job_id}: {job['status']}. {job['error'] or 'A local worker can continue queued work.'}",
+                        message_thread_id=context.message_thread_id)
+                    return
                 project = store.get_project(binding["project_name"])
                 if project is not None and (new_thread or not binding["thread_id"]):
                     store.set_telegram_binding(
@@ -705,6 +737,7 @@ def _context_from_update(update: dict[str, Any]) -> TelegramContext | None:
         username=username,
         chat_type=chat.get("type") or "",
         text=text,
+        update_id=update.get("update_id"),
     )
 
 

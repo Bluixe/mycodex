@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-head"><div><h1>Tasks and decisions</h1>
+<p>Tasks are saved before execution. Start a worker to continue queued work. A lost running task requires inspection before retry.</p></div></section>
+<p><a href="/jobs">Refresh task state</a>. Editing a goal preserves permissions and the remaining budget. Pausing a Codex turn does not stop already launched remote processes.</p>
+{% for decision in decisions %}
+<section class="panel"><h2>{{ decision.project }}</h2><p>{{ decision.next_action }}</p>
+{% for experiment in decision.experiments %}
+<p><strong>{{ experiment.name }}</strong> — {{ experiment.phase }}: {{ experiment.phase_message }}</p>
+{% endfor %}
+{% for research in decision.research %}
+<p><strong>{{ research.name }}</strong> — {{ research.phase }}: {{ research.phase_message }}
+<a href="/api/projects/{{ decision.project|urlencode }}/research/{{ research.name|urlencode }}/evidence">View source passages and coverage</a></p>
+{% endfor %}</section>
+{% if decision.review_workflows %}<section class="panel"><h3>Review decisions and observed cost</h3>
+{% for workflow in decision.review_workflows %}
+<p><a href="/api/reviews/{{ workflow.id }}">Review #{{ workflow.id }}</a>: {{ workflow.decision }} — {{ workflow.reason }}
+<br>Observed tokens: {{ workflow.observed_tokens if workflow.observed_tokens is not none else 'unknown' }}; accepted findings: {{ workflow.accepted_findings }}.
+{% if not workflow.benefit_verified %}Outcome has not been verified.{% endif %}</p>
+{% endfor %}</section>{% endif %}
+{% endfor %}
+<section class="panel"><h2>Saved tasks</h2>
+{% for job in jobs %}
+<article class="panel"><h3>#{{ job.id }} · {{ job.project_name }} · {{ job.kind }} <span class="badge">{{ job.status }}</span></h3>
+<p>{{ job.payload.prompt|default(job.payload.name|default('Project operation')) }}</p>
+<p>Time limit: {{ job.payload.timeout|default(1800) }} seconds.
+Token limit: {{ job.payload.max_total_tokens|default('not set', true) }}.</p>
+{% if job.result.budget_usage %}<p>Observed task tokens: {{ job.result.budget_usage.total_tokens }}.</p>{% endif %}
+{% if job.error %}<p>{{ job.error }}</p>{% endif %}
+{% if job.result.output_text %}<details><summary>Result</summary><pre>{{ job.result.output_text }}</pre></details>{% endif %}
+<p><a href="/api/jobs/{{ job.id }}">Inspect task and events</a></p>
+<p><a href="/api/jobs/{{ job.id }}/trace">Task trace (metadata only)</a>. Revision {{ job.revision }}.</p>
+{% if job.pause_requested_at and job.status == 'running' %}<p>Pause requested; waiting for the current turn to confirm interruption.</p>{% endif %}
+{% if job.status in ['queued','leased'] or (job.status == 'running' and job.kind in ['prompt','daily_summary','review_synthesis']) %}
+<form method="post" action="/jobs/{{ job.id }}/pause"><button type="submit">Pause task</button></form>
+{% endif %}
+{% if job.status == 'paused' %}
+<form method="post" action="/jobs/{{ job.id }}/resume"><input type="hidden" name="revision" value="{{ job.revision }}"><button type="submit">Resume saved task</button></form>
+{% endif %}
+{% if job.status in ['queued','paused'] and job.kind == 'prompt' and job.source != 'review-workflow' %}
+<details><summary>Change task goal</summary><form method="post" action="/jobs/{{ job.id }}/revise">
+<input type="hidden" name="revision" value="{{ job.revision }}">
+<textarea name="prompt" required rows="4">{{ job.payload.prompt }}</textarea><button type="submit">Save revised goal</button></form></details>
+{% endif %}
+{% if job.status in ['queued', 'leased', 'running','paused'] %}
+<form method="post" action="/jobs/{{ job.id }}/cancel"><button type="submit">Request cancellation</button></form>
+{% endif %}</article>
+{% else %}<p>No tasks have been queued.</p>{% endfor %}
+</section>
+{% endblock %}

@@ -4,6 +4,7 @@ import json
 import sys
 import time
 import traceback
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -24,22 +25,43 @@ def run_daemon(
     telegram_token_env: str = "MYCODEX_TELEGRAM_BOT_TOKEN",
     telegram_proxy_url: str | None = None,
 ) -> None:
-    while True:
-        try:
-            run_due_rules(
-                store,
-                timeout=timeout,
-                notify_telegram=notify_telegram,
-                telegram_token_file=telegram_token_file,
-                telegram_token_env=telegram_token_env,
-                telegram_proxy_url=telegram_proxy_url,
-            )
-        except Exception as exc:
-            _log(f"daemon cycle failed error={exc}")
-            traceback.print_exc(file=sys.stderr)
-        if once:
-            return
-        time.sleep(interval_seconds)
+    stop_worker = threading.Event()
+    def consume_queue():
+        from .jobs import run_worker
+        while not stop_worker.is_set():
+            try:
+                with Store(store.path) as worker_store:
+                    run_worker(worker_store, once=True, max_jobs=1)
+            except Exception as exc:
+                _log(f"queue worker cycle failed error={exc}")
+            stop_worker.wait(1)
+    worker_thread = threading.Thread(target=consume_queue, daemon=True)
+    if not once:
+        worker_thread.start()
+    try:
+        while True:
+            try:
+                run_due_rules(
+                    store,
+                    timeout=timeout,
+                    notify_telegram=notify_telegram,
+                    telegram_token_file=telegram_token_file,
+                    telegram_token_env=telegram_token_env,
+                    telegram_proxy_url=telegram_proxy_url,
+                    enqueue=True,
+                )
+            except Exception as exc:
+                _log(f"daemon cycle failed error={exc}")
+                traceback.print_exc(file=sys.stderr)
+            if once:
+                from .jobs import run_worker
+                run_worker(store, once=True, max_jobs=5)
+                return
+            time.sleep(interval_seconds)
+    finally:
+        stop_worker.set()
+        if worker_thread.is_alive():
+            worker_thread.join(timeout=2)
 
 
 def run_single_rule_watch(
@@ -127,6 +149,7 @@ def run_due_rules(
     telegram_token_file: str | None = None,
     telegram_token_env: str = "MYCODEX_TELEGRAM_BOT_TOKEN",
     telegram_proxy_url: str | None = None,
+    enqueue: bool = False,
 ) -> None:
     recovery = recover_stale_experiment_tasks(store, source="mycodex-daemon")
     if recovery["recovered_tasks"]:
@@ -137,6 +160,12 @@ def run_due_rules(
             _run_due_experiment_watchdogs(store, project)
         except Exception as exc:
             _log(f"experiment watchdog scheduler error project={project['name']} error={exc}")
+
+    if enqueue:
+        from .jobs import enqueue_scheduled_jobs
+        enqueue_scheduled_jobs(store, timeout=timeout, notification={"enabled": notify_telegram,
+            "token_file": telegram_token_file, "token_env": telegram_token_env, "proxy_url": telegram_proxy_url})
+        return
 
     for project in projects:
         if project["daily_summary_enabled"]:

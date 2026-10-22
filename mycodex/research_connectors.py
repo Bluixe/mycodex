@@ -1,24 +1,45 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
+from .research_documents import extract_pdf_document_bounded
+
 
 DEFAULT_SEARCH_PROVIDERS = ("zotero", "arxiv", "openalex", "semanticscholar")
 USER_AGENT = "mycodex/0.1 (+https://github.com/openai/codex)"
+MAX_SOURCE_BYTES = 50_000_000
+
+
+class SearchBatch(list):
+    """List-compatible results plus bounded provider coverage and provenance."""
+
+    def __init__(self, results=(), *, receipts=None):
+        super().__init__(results)
+        self.receipts = list(receipts or [])
+        states = {receipt['status'] for receipt in self.receipts}
+        self.coverage = ('unknown' if not states else 'unavailable' if states <= {'error', 'unavailable'}
+                         else 'partial' if states & {'error', 'unavailable'} else 'complete_requested')
+
+
+class ProviderHTTPError(RuntimeError):
+    def __init__(self, code: int, url: str):
+        self.code = code
+        super().__init__(f'HTTP {code} from {_redact_sensitive(url)}')
 
 
 @dataclass(frozen=True)
@@ -70,40 +91,64 @@ def search_public_sources(
     limit: int = 5,
     timeout: int = 30,
     semantic_scholar_api_key: str | None = None,
-) -> list[ResearchSearchResult]:
+    cache_dir: str | Path | None = None,
+    cache_ttl: int = 3600,
+    retries: int = 2,
+) -> SearchBatch:
     query = query.strip()
     if not query:
-        return []
+        return SearchBatch()
     selected = tuple(providers or DEFAULT_SEARCH_PROVIDERS)
     per_provider = max(1, int(limit or 5))
     results: list[ResearchSearchResult] = []
+    receipts = []
     for provider in selected:
         provider_key = provider.strip().lower()
+        started_at = int(time.time())
+        receipt = {'provider': provider_key, 'query': query, 'limit': per_provider,
+                   'requested_at': started_at, 'from_cache': False, 'attempts': 0,
+                   'exhaustive': False}
+        cache_root = Path(cache_dir) if cache_dir else None
+        cache_key = hashlib.sha256(json.dumps([provider_key, query, per_provider]).encode()).hexdigest()
+        cache_path = cache_root / f'{cache_key}.json' if cache_root and provider_key != 'zotero' else None
         try:
-            if provider_key == "arxiv":
-                results.extend(search_arxiv(query, limit=per_provider, timeout=timeout))
-            elif provider_key == "zotero":
-                results.extend(search_zotero(query, limit=per_provider))
-            elif provider_key == "openalex":
-                results.extend(search_openalex(query, limit=per_provider, timeout=timeout))
-            elif provider_key in {"semantic_scholar", "semanticscholar", "s2"}:
-                results.extend(
-                    search_semantic_scholar(
-                        query,
-                        limit=per_provider,
-                        timeout=timeout,
-                        api_key=semantic_scholar_api_key,
-                    )
-                )
+            cached = _read_search_cache(cache_path, ttl=cache_ttl)
+            if cached is not None:
+                provider_results = [ResearchSearchResult(**{**item, 'authors': tuple(item.get('authors') or ())})
+                                    for item in cached['results']]
+                receipt.update(from_cache=True, fetched_at=cached['fetched_at'])
             else:
-                continue
+                for attempt in range(max(0, int(retries)) + 1):
+                    receipt['attempts'] = attempt + 1
+                    try:
+                        if provider_key == "arxiv":
+                            provider_results = search_arxiv(query, limit=per_provider, timeout=timeout)
+                        elif provider_key == "zotero":
+                            provider_results = search_zotero(query, limit=per_provider)
+                        elif provider_key == "openalex":
+                            provider_results = search_openalex(query, limit=per_provider, timeout=timeout)
+                        elif provider_key in {"semantic_scholar", "semanticscholar", "s2"}:
+                            provider_results = search_semantic_scholar(query, limit=per_provider, timeout=timeout,
+                                                                      api_key=semantic_scholar_api_key)
+                        else:
+                            raise ValueError(f'unsupported research provider: {provider_key}')
+                        break
+                    except Exception as exc:
+                        if attempt >= max(0, int(retries)) or not _retryable(exc):
+                            raise
+                        time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                receipt['fetched_at'] = int(time.time())
+                if cache_path:
+                    _write_search_cache(cache_path, provider_results, receipt['fetched_at'])
+            results.extend(provider_results)
+            receipt.update(status='success' if provider_results else 'empty', result_count=len(provider_results),
+                           result_hash=_search_result_hash(provider_results))
         except Exception as exc:
-            # Public research APIs are best-effort and may rate-limit. Keep the
-            # worker moving with any successful providers; a zero-result task is
-            # visible in the research event stream.
-            continue
+            receipt.update(status='unavailable' if isinstance(exc, FileNotFoundError) else 'error',
+                           result_count=0, error_type=type(exc).__name__, error=_redact_sensitive(str(exc)))
+        receipts.append(receipt)
     deduped = _dedupe_results(results)
-    return deduped[: max(1, int(limit or 5)) * max(1, len(selected))]
+    return SearchBatch(deduped[:per_provider * max(1, len(selected))], receipts=receipts)
 
 
 def search_zotero(
@@ -115,7 +160,7 @@ def search_zotero(
     data_dir = _zotero_data_dir(zotero_dir)
     db_path = data_dir / "zotero.sqlite"
     if not db_path.exists():
-        return []
+        raise FileNotFoundError(f'Zotero library unavailable: {db_path}')
     with _zotero_snapshot(db_path) as snapshot:
         conn = sqlite3.connect(snapshot)
         conn.row_factory = sqlite3.Row
@@ -296,7 +341,7 @@ def search_arxiv(query: str, *, limit: int = 5, timeout: int = 30) -> list[Resea
             "sortOrder": "descending",
         }
     )
-    root = ET.fromstring(_read_url(f"http://export.arxiv.org/api/query?{params}", timeout=timeout))
+    root = ET.fromstring(_read_url(f"https://export.arxiv.org/api/query?{params}", timeout=timeout))
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     results: list[ResearchSearchResult] = []
     for entry in root.findall("atom:entry", ns):
@@ -338,6 +383,8 @@ def search_openalex(query: str, *, limit: int = 5, timeout: int = 30) -> list[Re
     mailto = os.environ.get("OPENALEX_MAILTO")
     if mailto:
         params["mailto"] = mailto
+    if os.environ.get('OPENALEX_API_KEY'):
+        params['api_key'] = os.environ['OPENALEX_API_KEY']
     data = _read_json(
         "https://api.openalex.org/works?" + urllib.parse.urlencode(params),
         timeout=timeout,
@@ -364,7 +411,7 @@ def search_openalex(query: str, *, limit: int = 5, timeout: int = 30) -> list[Re
                 abstract=_abstract_from_openalex(item.get("abstract_inverted_index")),
                 year=_int_or_none(item.get("publication_year")),
                 authors=authors,
-                venue=str((item.get("primary_location") or {}).get("source", {}).get("display_name") or ""),
+                venue=str(((item.get("primary_location") or {}).get("source") or {}).get("display_name") or ""),
                 provider="openalex",
                 provider_id=str(item.get("id") or ""),
                 doi=str(item.get("doi") or ""),
@@ -439,36 +486,54 @@ def ingest_text_source(
     *,
     max_chars: int = 12000,
     timeout: int = 60,
+    grobid_url: str | None = None,
 ) -> dict[str, Any]:
     location = location.strip()
     if not location:
         raise ValueError("source URL or path is required")
+    if type(max_chars) is not int or not 1 <= max_chars <= 2_000_000:
+        raise ValueError("max_chars must be an integer between 1 and 2000000")
     if _looks_like_url(location):
         payload, content_type, final_url = _read_url_bytes(location, timeout=timeout)
         suffix = _suffix_for_content(final_url, content_type)
-        text, method = _extract_bytes(payload, suffix=suffix, max_chars=max_chars)
+        extraction = _extract_source_bytes(payload, suffix=suffix, max_chars=max_chars, grobid_url=grobid_url, timeout=timeout)
+        text, method = extraction["text"], extraction["method"]
         return {
+            **extraction,
             "location": location,
             "resolved_location": final_url,
             "content_type": content_type,
             "bytes": len(payload),
             "text": text[:max_chars],
             "method": method,
+            "content_hash": hashlib.sha256(payload).hexdigest(),
+            "extraction_status": 'available' if text.strip() else 'unavailable',
+            "truncated": extraction.get("truncated", len(text) >= max_chars),
+            "fetched_at": int(time.time()),
         }
     parsed = urllib.parse.urlparse(location)
     if parsed.scheme == "file":
-        path = Path(urllib.parse.unquote(parsed.path)).expanduser().resolve()
+        path = Path(urllib.request.url2pathname(('//' + parsed.netloc if parsed.netloc else '') + parsed.path)).expanduser().resolve()
     else:
         path = Path(location).expanduser().resolve()
-    payload = path.read_bytes()
-    text, method = _extract_bytes(payload, suffix=path.suffix.lower(), max_chars=max_chars)
+    if not path.is_file():
+        raise ValueError("research source must be a regular readable file")
+    with path.open('rb') as reader:
+        payload = _bounded_source_bytes(reader)
+    extraction = _extract_source_bytes(payload, suffix=path.suffix.lower(), max_chars=max_chars, grobid_url=grobid_url, timeout=timeout)
+    text, method = extraction["text"], extraction["method"]
     return {
+        **extraction,
         "location": location,
         "resolved_location": str(path),
         "content_type": _content_type_for_suffix(path.suffix.lower()),
         "bytes": len(payload),
         "text": text[:max_chars],
         "method": method,
+        "content_hash": hashlib.sha256(payload).hexdigest(),
+        "extraction_status": 'available' if text.strip() else 'unavailable',
+        "truncated": extraction.get("truncated", len(text) >= max_chars),
+        "fetched_at": int(time.time()),
     }
 
 
@@ -481,7 +546,24 @@ class _zotero_snapshot:
     def __enter__(self) -> Path:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.snapshot = Path(self.tmpdir.name) / "zotero.sqlite"
-        shutil.copy2(self.db_path, self.snapshot)
+        source = destination = None
+        try:
+            # SQLite's backup API includes committed WAL data and produces one
+            # consistent snapshot while leaving the user's library read-only.
+            source = sqlite3.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=10)
+            destination = sqlite3.connect(self.snapshot)
+            source.backup(destination)
+        except Exception:
+            if destination is not None:
+                destination.close()
+                destination = None
+            self.tmpdir.cleanup()
+            raise
+        finally:
+            if source is not None:
+                source.close()
+            if destination is not None:
+                destination.close()
         return self.snapshot
 
     def __exit__(self, *_exc: object) -> None:
@@ -503,6 +585,60 @@ def _read_json(url: str, *, timeout: int, headers: dict[str, str] | None = None)
     return json.loads(_read_url(url, timeout=timeout, headers=headers))
 
 
+def _redact_sensitive(value: str) -> str:
+    value = re.sub(r'(?i)(api[_-]?key|token|password|secret)=([^&\s]+)', r'\1=[redacted]', value)
+    for name in ('OPENALEX_API_KEY', 'SEMANTIC_SCHOLAR_API_KEY'):
+        secret = os.environ.get(name)
+        if secret:
+            value = value.replace(secret, '[redacted]').replace(urllib.parse.quote(secret), '[redacted]')
+    return value[:1200]
+
+
+def _retryable(exc: Exception) -> bool:
+    code = getattr(exc, 'code', None)
+    return code == 429 or (isinstance(code, int) and code >= 500) or isinstance(exc, (urllib.error.URLError, TimeoutError))
+
+
+def _read_search_cache(path: Path | None, *, ttl: int) -> dict[str, Any] | None:
+    if path is None or ttl <= 0:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+        if value.get('schema_version') != 1 or not isinstance(value.get('results'), list):
+            return None
+        if not 0 <= time.time() - float(value['fetched_at']) <= ttl:
+            return None
+        items = [ResearchSearchResult(**item) for item in value['results']]
+        if value.get('result_hash') != _search_result_hash(items):
+            return None
+        return value
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_search_cache(path: Path, results: list[ResearchSearchResult], fetched_at: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replacement also tolerates concurrent cache users. Cache writes
+        # are optional; their failure must not discard a successful provider result.
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump({'schema_version': 1, 'fetched_at': fetched_at,
+                       'result_hash': _search_result_hash(results),
+                       'results': [asdict(item) for item in results]}, tmp, ensure_ascii=False)
+        try:
+            tmp_path.replace(path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def _search_result_hash(results: list[ResearchSearchResult]) -> str:
+    return hashlib.sha256(json.dumps([asdict(item) for item in results], sort_keys=True,
+                                     ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
 def _read_url_bytes(
     url: str,
     *,
@@ -515,13 +651,41 @@ def _read_url_bytes(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return (
-                response.read(),
+                _bounded_source_bytes(response),
                 response.headers.get("content-type", ""),
                 response.geturl(),
             )
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+        raise ProviderHTTPError(exc.code, url) from exc
+
+
+def _bounded_source_bytes(stream) -> bytes:
+    payload = stream.read(MAX_SOURCE_BYTES + 1)
+    if len(payload) > MAX_SOURCE_BYTES:
+        raise ValueError('research source exceeds the 50 MB input limit')
+    return payload
+
+
+def _extract_source_bytes(payload: bytes, *, suffix: str, max_chars: int,
+                          grobid_url: str | None = None, timeout: int = 30) -> dict[str, Any]:
+    if suffix.lower() == ".pdf" or payload[:5] == b"%PDF-":
+        started = time.monotonic()
+        result = extract_pdf_document_bounded(payload, max_chars=max_chars, grobid_url=grobid_url, timeout=timeout)
+        if result["text"].strip():
+            return result
+        remaining = timeout - (time.monotonic() - started)
+        fallback = _extract_pdf_with_pdftotext(payload, max_chars=max_chars + 1, timeout=min(30, remaining)) if remaining > 0 else ""
+        if fallback.strip():
+            return {**result, "text": fallback[:max_chars], "passages": None, "method": "pdftotext",
+                    "extraction_status": "available", "truncated": len(fallback) > max_chars,
+                    "document_structure": {"schema_version": 1, "source_sha256": hashlib.sha256(payload).hexdigest(),
+                        "coordinate_system": "extracted_text", "pages": [], "elements": [],
+                        "fallback_reason": result.get("extraction_error", "structured text unavailable"),
+                        "coverage": {"page_count": None, "complete_text_extraction": False},
+                        "semantic_verified": False}}
+        return {**result, "method": "pdf-unavailable"}
+    text, method = _extract_bytes(payload, suffix=suffix, max_chars=max_chars)
+    return {"text": text, "method": method, "truncated": len(text) >= max_chars}
 
 
 def _extract_bytes(payload: bytes, *, suffix: str, max_chars: int) -> tuple[str, str]:
@@ -537,16 +701,18 @@ def _extract_bytes(payload: bytes, *, suffix: str, max_chars: int) -> tuple[str,
     return raw[:max_chars], "text"
 
 
-def _extract_pdf_with_pdftotext(payload: bytes, *, max_chars: int) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-        tmp.write(payload)
-        tmp.flush()
+def _extract_pdf_with_pdftotext(payload: bytes, *, max_chars: int, timeout: float = 30) -> str:
+    # Windows does not allow another process to open NamedTemporaryFile while
+    # Python still holds its default exclusive handle.
+    with tempfile.TemporaryDirectory(prefix='mycodex-pdf-') as tmpdir:
+        pdf_path = Path(tmpdir) / 'source.pdf'
+        pdf_path.write_bytes(payload)
         try:
             result = subprocess.run(
-                ["pdftotext", "-layout", tmp.name, "-"],
+                ["pdftotext", "-layout", str(pdf_path), "-"],
                 check=False,
                 capture_output=True,
-                timeout=30,
+                timeout=timeout,
                 text=True,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):

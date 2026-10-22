@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from . import __version__
 
 
 class CodexAppServerError(RuntimeError):
     pass
+
+
+class CodexRuntimeCompatibilityError(CodexAppServerError):
+    """The selected binary cannot load the user's current configuration."""
 
 
 @dataclass
@@ -22,10 +29,16 @@ class TurnResult:
     output_text: str
     completed: bool
     raw: dict[str, Any]
+    status: str = "unknown"
+    token_usage: dict[str, Any] = field(default_factory=dict)
 
 
 class CodexAppServerClient:
-    """Small JSON-lines client for `codex app-server --listen stdio://`."""
+    """Single-consumer JSON-lines client for the local Codex app-server.
+
+    Serialize request/wait calls. Control methods may be called from a wait
+    callback; concurrent consumers on separate Python threads are unsupported.
+    """
 
     def __init__(self, codex_bin: str = "codex") -> None:
         self.codex_bin = _resolve_codex_bin(codex_bin)
@@ -36,6 +49,9 @@ class CodexAppServerClient:
         self._reader: threading.Thread | None = None
         self._stderr: threading.Thread | None = None
         self._stderr_lines: list[str] = []
+        self._write_lock = threading.Lock()
+        self.interrupt_grace_seconds = 3.0
+        self.operation_deadline: float | None = None
 
     def __enter__(self) -> "CodexAppServerClient":
         self.start()
@@ -47,31 +63,39 @@ class CodexAppServerClient:
     def start(self) -> None:
         if self.proc is not None:
             return
+        self._events = queue.Queue()
+        self._buffer.clear()
         self.proc = subprocess.Popen(
             [self.codex_bin, "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
         self._stderr = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr.start()
-        self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "mycodex",
-                    "title": "mycodex",
-                    "version": "0.1.0",
+        try:
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "mycodex",
+                        "title": "mycodex",
+                        "version": __version__,
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            },
-            timeout=30,
-        )
-        self.notify("initialized")
+                timeout=30,
+            )
+            self.notify("initialized")
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         proc = self.proc
@@ -90,20 +114,28 @@ class CodexAppServerClient:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=2)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
         self.proc = None
 
     def _read_stdout(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
-        for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                self._events.put({"method": "client/parseError", "params": {"line": line}})
-                continue
-            self._events.put(obj)
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    self._events.put({"method": "client/parseError", "params": {"line": line}})
+                    continue
+                if isinstance(obj, dict):
+                    self._events.put(obj)
+        finally:
+            self._events.put({"method": "client/disconnected", "params": {}})
 
     def _read_stderr(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
@@ -113,8 +145,12 @@ class CodexAppServerClient:
     def _write(self, obj: dict[str, Any]) -> None:
         if self.proc is None or self.proc.stdin is None or self.proc.stdin.closed:
             raise CodexAppServerError("codex app-server is not running")
-        self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
+        with self._write_lock:
+            try:
+                self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise CodexAppServerError("codex app-server connection closed") from exc
 
     def notify(self, method: str, params: Any | None = None) -> None:
         msg: dict[str, Any] = {"method": method}
@@ -122,7 +158,21 @@ class CodexAppServerClient:
             msg["params"] = params
         self._write(msg)
 
+    def _rpc_timeout(self, method: str, timeout: float) -> float:
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise CodexAppServerError(f"no time budget remaining before {method}")
+        if method in {"turn/interrupt", "thread/archive"}:
+            return min(timeout, 5.0)
+        if self.operation_deadline is not None:
+            remaining = self.operation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexAppServerError(f"operation deadline exceeded before {method}")
+            timeout = min(timeout, remaining)
+        return timeout
+
     def request(self, method: str, params: Any | None = None, timeout: int = 60) -> Any:
+        timeout = self._rpc_timeout(method, timeout)
         req_id = self._next_id
         self._next_id += 1
         msg: dict[str, Any] = {"id": req_id, "method": method, "params": params}
@@ -132,8 +182,20 @@ class CodexAppServerClient:
             event = self._next_event(deadline, include_buffer=False)
             if event is None:
                 break
+            if event.get("method") == "client/disconnected":
+                # Preserve EOF for the turn waiter after nested interrupt/read RPCs.
+                self._buffer.append(event)
+                raise CodexAppServerError(f"codex app-server disconnected while waiting for {method}")
             if event.get("id") == req_id and ("result" in event or "error" in event):
                 if "error" in event:
+                    error_text = json.dumps(event["error"], ensure_ascii=False)
+                    if ("config" in error_text.lower() and any(marker in error_text.lower() for marker in (
+                            "unknown variant", "failed to load", "failed to parse", "invalid configuration"))):
+                        raise CodexRuntimeCompatibilityError(
+                            f"{method} failed: the selected Codex runtime cannot load the configured settings. "
+                            "Select a compatible executable with MYCODEX_CODEX_BIN or use the current "
+                            "desktop-provided CODEX_CLI_PATH. The configuration was not modified."
+                        )
                     raise CodexAppServerError(f"{method} failed: {event['error']}")
                 return event.get("result")
             if self._is_server_request(event):
@@ -244,6 +306,7 @@ class CodexAppServerClient:
         approval_policy: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        output_schema: dict[str, Any] | None = None,
     ) -> tuple[str | None, dict[str, Any]]:
         params: dict[str, Any] = {
             "threadId": thread_id,
@@ -257,9 +320,23 @@ class CodexAppServerClient:
             params["model"] = model
         if reasoning_effort:
             params["effort"] = reasoning_effort
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
         result = self.request("turn/start", params, timeout=60)
         turn = (result or {}).get("turn") or {}
+        if not turn.get("id"):
+            raise CodexAppServerError("Codex did not return a turn id")
         return turn.get("id"), turn
+
+    def interrupt_turn(self, *, thread_id: str, turn_id: str, timeout: int = 5) -> Any:
+        return self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=timeout)
+
+    def steer_turn(self, *, thread_id: str, turn_id: str, prompt: str) -> Any:
+        return self.request(
+            "turn/steer",
+            {"threadId": thread_id, "expectedTurnId": turn_id,
+             "input": [{"type": "text", "text": prompt, "text_elements": []}]},
+        )
 
     def wait_for_turn(
         self,
@@ -268,55 +345,185 @@ class CodexAppServerClient:
         turn_id: str | None,
         timeout: int,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        cancellation_callback: Callable[[], bool] | None = None,
+        usage_callback: Callable[[dict[str, Any]], bool | None] | None = None,
+        _interrupt_on_timeout: bool = True,
+        _usage_baseline: dict[str, int] | None = None,
     ) -> TurnResult:
         deadline = time.monotonic() + timeout
-        deltas: list[str] = []
+        deltas: dict[str, list[str]] = {}
+        phases: dict[str, str] = {}
+        messages: dict[str, str] = {}
         completed_turn: dict[str, Any] | None = None
-        final_agent_message = ""
         errors: list[Any] = []
+        token_usage: dict[str, Any] = {}
+        usage_baseline: dict[str, int] | None = _usage_baseline
+        status = "timeout"
+        stop_reason = ""
+        requested_stop_reason = ""
+        drained_output = ""
+        interrupt_requested = False
+
+        def matches(params: dict[str, Any]) -> bool:
+            return params.get("threadId") == thread_id and (
+                turn_id is None or params.get("turnId") == turn_id
+            )
+
         while time.monotonic() < deadline:
-            event = self._next_event(deadline)
-            if event is None:
+            if cancellation_callback is not None and cancellation_callback():
+                status, stop_reason = "cancelled", "cancelled by caller"
                 break
+            poll_deadline = min(deadline, time.monotonic() + 0.25) if cancellation_callback else deadline
+            event = self._next_event(poll_deadline)
+            if event is None:
+                if time.monotonic() >= deadline:
+                    break
+                continue
             if self._is_server_request(event):
                 self._auto_respond_to_server_request(event)
                 continue
+            method = event.get("method")
+            if method == "client/disconnected":
+                status, stop_reason = "failed", "app-server disconnected before turn completion"
+                break
+            if method == "client/parseError":
+                status, stop_reason = "failed", "invalid JSON from app-server"
+                errors.append(event.get("params") or {})
+                break
+            params = event.get("params") or {}
+            # Callbacks may persist events or enforce budgets; never mix another
+            # thread's output/usage into this run.
+            if method not in {"client/parseError"} and params.get("threadId") != thread_id:
+                continue
             if on_event is not None:
                 on_event(event)
-            method = event.get("method")
-            params = event.get("params") or {}
             if method == "item/agentMessage/delta":
-                if params.get("threadId") == thread_id and (turn_id is None or params.get("turnId") == turn_id):
-                    deltas.append(params.get("delta") or "")
-            elif method == "item/completed":
+                if matches(params):
+                    deltas.setdefault(str(params.get("itemId") or ""), []).append(params.get("delta") or "")
+            elif method in {"item/started", "item/completed"}:
                 item = params.get("item") or {}
-                if (
-                    params.get("threadId") == thread_id
-                    and (turn_id is None or params.get("turnId") == turn_id)
-                    and item.get("type") == "agentMessage"
-                ):
-                    final_agent_message = item.get("text") or final_agent_message
-            elif method == "turn/completed":
-                if params.get("threadId") == thread_id:
-                    turn = params.get("turn") or {}
-                    if turn_id is None or turn.get("id") == turn_id:
-                        completed_turn = turn
+                if matches(params) and item.get("type") == "agentMessage":
+                    item_id = str(item.get("id") or "")
+                    phases[item_id] = item.get("phase") or ""
+                    if method == "item/completed" and isinstance(item.get("text"), str):
+                        messages[item_id] = item["text"]
+            elif method == "thread/tokenUsage/updated":
+                if params.get("turnId") not in (None, turn_id):
+                    continue
+                usage = params.get("tokenUsage")
+                if isinstance(usage, dict):
+                    token_usage = dict(usage)
+                    total, last = usage.get("total"), usage.get("last")
+                    if isinstance(total, dict) and isinstance(last, dict):
+                        if usage_baseline is None:
+                            usage_baseline = {
+                                key: max(0, value - last.get(key, 0))
+                                for key, value in total.items()
+                                if type(value) is int and type(last.get(key, 0)) is int
+                            }
+                        token_usage["turn"] = {
+                            key: max(0, value - usage_baseline.get(key, value))
+                            for key, value in total.items() if type(value) is int
+                        }
+                    if usage_callback is not None and usage_callback(dict(token_usage)) is False:
+                        status, stop_reason = "cancelled", "token budget callback requested stop"
                         break
-            elif method == "error":
+            elif method == "turn/completed":
+                turn = params.get("turn") or {}
+                if turn_id is None or turn.get("id") == turn_id:
+                    completed_turn = turn
+                    status = turn.get("status") or "failed"
+                    if status not in {"completed", "interrupted", "failed"}:
+                        stop_reason = f"invalid terminal turn status: {status}"
+                        status = "failed"
+                    if turn.get("error"):
+                        errors.append(turn["error"])
+                        status = "failed"
+                    break
+            elif method in {"turn/failed", "turn/interrupted"} and matches(params):
+                status = "failed" if method == "turn/failed" else "interrupted"
                 errors.append(params)
-        output = "".join(deltas).strip() or final_agent_message.strip()
-        if completed_turn and not output:
-            output = self.read_latest_agent_message(thread_id)
-        raw = {"turn": completed_turn or {}, "errors": errors}
+                break
+            elif method == "error":
+                if params.get("turnId") in (None, turn_id):
+                    errors.append(params)
+                    # Recoverable provider errors can be followed by a successful
+                    # retry; an explicitly non-retryable error is terminal.
+                    if params.get("willRetry") is False:
+                        status, stop_reason = "failed", "non-retryable Codex error"
+                        break
+
+        if _interrupt_on_timeout and status in {"timeout", "cancelled"} and turn_id:
+            if not stop_reason:
+                stop_reason = f"turn timed out after {timeout} seconds"
+            requested_stop_reason = stop_reason
+            interrupt_requested = True
+            try:
+                self.interrupt_turn(thread_id=thread_id, turn_id=turn_id)
+            except CodexAppServerError as exc:
+                errors.append({"interrupt_error": str(exc)})
+
+            def observe_final_usage(usage):
+                if usage_callback is not None:
+                    usage_callback(usage)
+                return True
+
+            # An interrupt RPC response acknowledges the request, not completion
+            # of in-flight tools. Only a terminal notification is a checkpoint.
+            drained = self.wait_for_turn(
+                thread_id=thread_id, turn_id=turn_id,
+                timeout=min(5.0, max(0.0, self.interrupt_grace_seconds)),
+                on_event=on_event, usage_callback=observe_final_usage,
+                _interrupt_on_timeout=False, _usage_baseline=usage_baseline,
+            )
+            errors.extend(drained.raw.get("errors") or [])
+            if drained.raw.get("turn") and drained.status in {"completed", "interrupted", "failed"}:
+                completed_turn = drained.raw["turn"]
+                status = drained.status
+                drained_output = drained.output_text
+                if drained.token_usage:
+                    token_usage = drained.token_usage
+                stop_reason = "" if status == "completed" else requested_stop_reason
+            else:
+                status = "needs_reconciliation"
+                stop_reason = requested_stop_reason + "; terminal interruption was not confirmed"
+
+        # The completed final message is authoritative. Joining deltas from all
+        # items also joins commentary into JSON and can invalidate contracts.
+        def choose(items: dict[str, str]) -> str:
+            finals = [text for item_id, text in items.items() if phases.get(item_id) == "final_answer"]
+            legacy = [text for item_id, text in items.items() if not phases.get(item_id)]
+            return (finals or legacy or [""])[-1].strip()
+
+        output = choose(messages)
+        if not output:
+            output = choose({key: "".join(chunks) for key, chunks in deltas.items()})
+        if completed_turn and status == "completed" and not output:
+            for item in completed_turn.get("items") or []:
+                if item.get("type") == "agentMessage":
+                    item_id = str(item.get("id") or "")
+                    phases[item_id] = item.get("phase") or ""
+                    messages[item_id] = item.get("text") or ""
+            output = choose(messages)
+        if drained_output:
+            output = drained_output
+        raw = {"turn": completed_turn or {}, "errors": errors, "status": status,
+               "token_usage": token_usage, "stop_reason": stop_reason,
+               "interrupt_requested": interrupt_requested,
+               "interruption_confirmed": bool(completed_turn) and status == "interrupted",
+               "terminal_confirmed": bool(completed_turn) and status in {"completed", "interrupted", "failed"},
+               "requested_stop_reason": requested_stop_reason}
         return TurnResult(
             thread_id=thread_id,
             turn_id=turn_id,
             output_text=output,
-            completed=completed_turn is not None,
+            completed=status == "completed",
             raw=raw,
+            status=status,
+            token_usage=token_usage,
         )
 
-    def read_latest_agent_message(self, thread_id: str) -> str:
+    def read_latest_agent_message(self, thread_id: str, turn_id: str | None = None) -> str:
         result = self.request(
             "thread/read",
             {"threadId": thread_id, "includeTurns": True},
@@ -324,18 +531,27 @@ class CodexAppServerClient:
         )
         thread = (result or {}).get("thread") or {}
         for turn in reversed(thread.get("turns") or []):
+            if turn_id is not None and turn.get("id") != turn_id:
+                continue
             for item in reversed(turn.get("items") or []):
-                if item.get("type") == "agentMessage" and item.get("text"):
+                if (item.get("type") == "agentMessage" and item.get("text")
+                        and item.get("phase") != "commentary"):
                     return item["text"].strip()
         return ""
 
 
 def _resolve_codex_bin(codex_bin: str) -> str:
+    # Explicit caller intent wins; then an application-level user override,
+    # then the current desktop's companion binary, and finally PATH discovery.
+    if codex_bin != "codex":
+        return codex_bin
     configured = os.environ.get("MYCODEX_CODEX_BIN")
     if configured:
         return configured
-    if codex_bin != "codex":
-        return codex_bin
+    desktop_binary = os.environ.get("CODEX_CLI_PATH")
+    if desktop_binary and os.path.isfile(desktop_binary) and os.access(desktop_binary, os.X_OK):
+        if os.name != "nt" or os.path.splitext(desktop_binary)[1].lower() in {".exe", ".com", ".cmd", ".bat"}:
+            return desktop_binary
     found = shutil.which("codex")
     if found:
         return found

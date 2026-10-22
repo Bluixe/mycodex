@@ -20,6 +20,8 @@ from .status import (
     snapshot_to_jsonable,
 )
 from .token_usage import token_usage_snapshot
+from .jobs import JobQueue
+from .diagnostics import decision_snapshot
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -32,6 +34,15 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app = FastAPI(title="mycodex dashboard")
     app.state.db_path = resolved_db_path
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.middleware("http")
+    async def same_origin_mutations(request: Request, call_next):
+        origin = request.headers.get("origin")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc != request.headers.get("host"):
+                return JSONResponse({"error": "cross-origin mutations are not allowed"}, status_code=403)
+        return await call_next(request)
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.filters["ts"] = format_ts
@@ -114,13 +125,15 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.post("/projects/{project_name}/sync")
     def sync_project(project_name: str, background_tasks: BackgroundTasks):
-        background_tasks.add_task(_sync_project_task, resolved_db_path, project_name)
-        return _redirect(f"/projects/{project_name}")
+        with Store(resolved_db_path) as store:
+            JobQueue(store).submit(project_name, "sync_sessions", source="web")
+        return _redirect("/jobs")
 
     @app.post("/projects/{project_name}/daily-summary")
     def daily_summary(project_name: str, background_tasks: BackgroundTasks):
-        background_tasks.add_task(_daily_summary_task, resolved_db_path, project_name)
-        return _redirect(f"/projects/{project_name}")
+        with Store(resolved_db_path) as store:
+            JobQueue(store).submit(project_name, "daily_summary", source="web")
+        return _redirect("/jobs")
 
     @app.post("/projects/{project_name}/send")
     async def send_project_prompt(
@@ -131,14 +144,97 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         form = await _read_form(request)
         prompt = form.get("prompt", "").strip()
         if prompt:
-            background_tasks.add_task(
-                _send_prompt_task,
-                resolved_db_path,
-                project_name,
-                prompt,
-                form.get("new_thread") == "on",
-            )
-        return _redirect(f"/projects/{project_name}")
+            with Store(resolved_db_path) as store:
+                JobQueue(store).submit(project_name, "prompt",
+                    {"prompt": prompt, "new_thread": form.get("new_thread") == "on"}, source="web")
+        return _redirect("/jobs")
+
+    @app.get("/jobs", response_class=HTMLResponse)
+    def jobs_page(request: Request, project: str | None = None):
+        with Store(resolved_db_path) as store:
+            jobs = JobQueue(store).list(project)
+            projects = [dict(row) for row in store.list_projects()]
+            decisions = [decision_snapshot(store, row["name"]) for row in projects]
+        return render(request, "jobs.html", {"jobs": jobs, "decisions": decisions,
+            "page_title": "Tasks and decisions", "refresh_interval_ms": 0})
+
+    @app.get("/api/jobs")
+    def api_jobs(project: str | None = None):
+        with Store(resolved_db_path) as store:
+            return JSONResponse(JobQueue(store).list(project))
+
+    @app.get("/api/jobs/{job_id}")
+    def api_job(job_id: int):
+        with Store(resolved_db_path) as store:
+            queue = JobQueue(store)
+            job = queue.get(job_id)
+            return JSONResponse({"job": job, "events": queue.events(job_id)}, status_code=200 if job else 404)
+
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel_job(job_id: int):
+        with Store(resolved_db_path) as store:
+            if JobQueue(store).get(job_id) is None:
+                return JSONResponse({"error": "unknown job"}, status_code=404)
+            JobQueue(store).cancel(job_id)
+        return _redirect("/jobs")
+
+    @app.post('/jobs/{job_id}/{action}')
+    async def control_job(job_id: int, action: str, request: Request):
+        if action not in {'pause','resume','revise'}:
+            return JSONResponse({'error': 'unknown action'}, status_code=404)
+        form = await _read_form(request)
+        with Store(resolved_db_path) as store:
+            queue = JobQueue(store)
+            if queue.get(job_id) is None:
+                return JSONResponse({'error': 'unknown job'}, status_code=404)
+            try:
+                if action == 'pause':
+                    queue.pause(job_id)
+                elif action == 'resume':
+                    queue.resume(job_id, expected_revision=int(form['revision']) if 'revision' in form else None)
+                else:
+                    queue.revise(job_id, form.get('prompt'), expected_revision=int(form.get('revision', '-1')))
+            except (ValueError, TypeError) as exc:
+                return JSONResponse({'error': str(exc)}, status_code=409)
+        return _redirect('/jobs')
+
+    @app.get('/api/jobs/{job_id}/trace')
+    def api_trace(job_id: int):
+        from .tracing import job_trace
+        with Store(resolved_db_path) as store:
+            try:
+                return JSONResponse(job_trace(store, job_id))
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=404)
+
+    @app.get('/api/reviews/{workflow_id}')
+    def api_review(workflow_id: int):
+        from .review_workflow import workflow_report
+        with Store(resolved_db_path) as store:
+            try:
+                return JSONResponse(workflow_report(store, workflow_id))
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=404)
+
+    @app.get("/api/projects/{project_name}/decisions")
+    def api_decisions(project_name: str):
+        with Store(resolved_db_path) as store:
+            if store.get_project(project_name) is None:
+                return JSONResponse({"error": "unknown project"}, status_code=404)
+            return JSONResponse(decision_snapshot(store, project_name))
+
+    @app.get("/api/projects/{project_name}/research/{research_name}/evidence")
+    def api_evidence(project_name: str, research_name: str, query: str | None = None):
+        from .research_evidence import EvidenceLedger
+        with Store(resolved_db_path) as store:
+            project = store.get_project(project_name)
+            research = store.get_research_thread(project["id"], research_name) if project else None
+            if research is None:
+                return JSONResponse({"error": "unknown research"}, status_code=404)
+            ledger = EvidenceLedger(store)
+            return JSONResponse({"passages": ledger.search_evidence(research["id"], query or research["question"]),
+                                 "links": ledger.list_evidence(research["id"]),
+                                 "coverage": ledger.list_search_receipts(research["id"])})
 
     @app.post("/projects/{project_name}/todos")
     async def create_todo(project_name: str, request: Request):

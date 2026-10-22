@@ -36,7 +36,7 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(plist["Label"], label)
             self.assertTrue(plist["RunAtLoad"])
             self.assertTrue(plist["KeepAlive"])
-            self.assertEqual(args[:3], ["/usr/bin/python3", "-m", "mycodex"])
+            self.assertEqual(args[:3], [str(Path("/usr/bin/python3").resolve()), "-m", "mycodex"])
             self.assertIn("--db", args)
             self.assertIn(str(db_path.resolve()), args)
             self.assertIn("daemon", args)
